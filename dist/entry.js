@@ -7,7 +7,7 @@
 //   &budget=<n>      max fetch() subrequests for the query (default 50, the Free plan's external cap)
 
 // worker-build's shim attaches every #[wasm_bindgen] export to the entrypoint class as a method.
-import Entrypoint from "../build/index.js";
+import Entrypoint from "./index.js";
 
 const INFO_SQL = `SELECT version() AS version,
   (SELECT string_agg(extension_name, ',') FROM duckdb_extensions() WHERE loaded) AS extensions,

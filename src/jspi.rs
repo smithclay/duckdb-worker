@@ -6,7 +6,7 @@
 //! wasm stack until the fetch() settles and then copies the bytes into DuckDB's buffer.
 //!
 //! Needs an Emscripten with JSPI lifecycle hooks (`-sREENTRANT_JSPI`) and
-//! `--cfg=wasm_bindgen_unstable_jspi`; see wrangler.jspi.toml.
+//! `--cfg=wasm_bindgen_unstable_jspi`; see scripts/jspi-toolchain.sh and wrangler.toml.
 #![allow(deprecated)] // wasm-bindgen marks jspi/suspending as experimental via deprecation warnings
 
 use js_sys::Uint8Array;
@@ -14,28 +14,57 @@ use std::cell::Cell;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(inline_js = r#"
-export async function dw_fetch_size(url) {
-  let r = await fetch(url, { method: "HEAD" });
-  const len = r.headers.get("content-length");
-  if (r.ok && len !== null) return Number(len);
-  // Some servers omit Content-Length on HEAD: ask for one byte and read Content-Range.
-  r = await fetch(url, { headers: { Range: "bytes=0-0" } });
-  const cr = r.headers.get("content-range");
-  await r.body?.cancel();
-  if (r.status === 206 && cr) return Number(cr.split("/")[1]);
-  return -1;
+// Range reads are only trustworthy when the server sends stored bytes. Workers' fetch() always
+// negotiates compression and transparently decodes, and on a compressed response Range and
+// Content-Range describe the encoded bytes (the decoded body of a partial range comes back
+// empty or garbled, and Content-Range reports the encoded size). So probe with a 1 KiB range:
+// exactly the requested bytes back means ranges work; anything else means download the whole
+// (decoded) body once and serve slices of it for this query.
+const PROBE = 1024;
+const wholeBodies = new Map();
+
+export function dw_reset_bodies() {
+  wholeBodies.clear();
 }
-export async function dw_fetch_range(url, start, len) {
-  const r = await fetch(url, { headers: { Range: `bytes=${start}-${start + len - 1}` } });
-  if (r.status === 206) return new Uint8Array(await r.arrayBuffer());
-  if (r.status === 200) {
-    // Server ignored Range: fall back to slicing the full body.
-    return new Uint8Array(await r.arrayBuffer()).slice(start, start + len);
+
+async function wholeBody(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
+  const body = new Uint8Array(await r.arrayBuffer());
+  wholeBodies.set(url, body);
+  return body;
+}
+
+export async function dw_fetch_size(url) {
+  if (wholeBodies.has(url)) return wholeBodies.get(url).length;
+  const r = await fetch(url, { headers: { range: `bytes=0-${PROBE - 1}` } });
+  if (r.status === 206) {
+    const probe = new Uint8Array(await r.arrayBuffer());
+    const total = Number(r.headers.get("content-range")?.split("/")[1]);
+    if (total > 0 && probe.length === Math.min(PROBE, total)) return total;
+  } else {
+    await r.body?.cancel();
   }
-  throw new Error(`HTTP ${r.status} for ${url} bytes=${start}+${len}`);
+  return (await wholeBody(url)).length;
+}
+
+export async function dw_fetch_range(url, start, len) {
+  let body = wholeBodies.get(url);
+  if (!body) {
+    const r = await fetch(url, { headers: { range: `bytes=${start}-${start + len - 1}` } });
+    if (r.status === 206) {
+      const part = new Uint8Array(await r.arrayBuffer());
+      if (part.length === len) return part;
+    } else {
+      await r.body?.cancel();
+    }
+    body = await wholeBody(url);
+  }
+  return body.slice(start, start + len);
 }
 "#)]
 extern "C" {
+    fn dw_reset_bodies();
     #[wasm_bindgen(catch, suspending)]
     fn dw_fetch_size(url: &str) -> Result<f64, JsValue>;
     #[wasm_bindgen(catch, suspending)]
@@ -117,10 +146,12 @@ pub fn query_jspi(sql: String, budget: u32) -> Result<String, JsValue> {
     REQUESTS.set(0);
     BYTES.set(0);
     BUDGET.set(budget as u64);
-    // Cached sizes/blocks are per query: no stale data, and no memory held between requests.
+    // Cached sizes/blocks/bodies are per query: no stale data, no memory held between requests.
     unsafe { dw_reset_http_cache() };
+    dw_reset_bodies();
     let (ok, body) = crate::query(&sql);
     unsafe { dw_reset_http_cache() };
+    dw_reset_bodies();
     if ok {
         Ok(body)
     } else {

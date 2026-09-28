@@ -34,7 +34,8 @@ fn main() {
         println!("cargo:rustc-link-arg={}", lib.display());
     }
     println!("cargo:rustc-link-arg=-Wl,--end-group");
-    if std::env::var_os("CARGO_FEATURE_JSPI").is_some() {
+    {
+        // The http(s) range-read FileSystem (src/jspi_fs.cpp) compiles against DuckDB's headers.
         let src = PathBuf::from(
             std::env::var("DUCKDB_SRC")
                 .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/duckdb").into()),

@@ -6,4 +6,3 @@
 .wrangler
 node_modules
 *.log
-/build-jspi

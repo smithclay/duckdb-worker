@@ -9,19 +9,12 @@ publish = false
 
 [dependencies]
 # Pinned to the workers-rs commit that ships the --emscripten target (worker 0.8.7).
-futures-util = { version = "0.3", default-features = false }
 worker = { git = "https://github.com/cloudflare/workers-rs", rev = "b57ba6ef8198c65499c2f92b1845cc2412dd6e8c" }
-
 js-sys = "0.3.106"
 wasm-bindgen = "=0.2.129"
 
 [build-dependencies]
 cc = "1"
-
-[features]
-# DuckDB reads http(s) files with fetch() range requests via JSPI. Needs the JSPI
-# toolchain described in wrangler.jspi.toml.
-jspi = []
 
 [profile.release]
 opt-level = "s"

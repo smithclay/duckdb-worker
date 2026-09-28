@@ -1,23 +1,14 @@
 //! DuckDB v2 (tiny static build) inside a Rust Worker on the emscripten target.
 //!
-//! GET  /?q=<sql>   run a query, TSV back
-//! POST /           run the body as SQL
-//! GET  /           version + loaded extensions
-//!
-//! One in-memory database per isolate, opened on first request.
-//!
-//! Remote files: DuckDB's file I/O is synchronous and Workers can only fetch
-//! asynchronously, so http(s) URLs in the SQL are downloaded up front with
-//! `fetch()` into Emscripten's in-memory filesystem and the SQL is rewritten to
-//! read the local copies. Whole files, no range requests.
+//! One in-memory database per isolate, opened on first query. HTTP handling lives in
+//! src/entry.js, which calls the `query_jspi` export (src/jspi.rs); DuckDB reads http(s)
+//! files itself with fetch() range requests through src/jspi_fs.cpp.
 
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
-use worker::*;
 
 fn main() {}
 
-#[cfg(feature = "jspi")]
 mod jspi;
 
 #[repr(C)]
@@ -47,7 +38,6 @@ extern "C" {
     fn duckdb_column_name(result: *mut DuckResult, col: u64) -> *const c_char;
     fn duckdb_value_varchar(result: *mut DuckResult, col: u64, row: u64) -> *mut c_char;
     fn duckdb_free(ptr: *mut c_void);
-    #[cfg(feature = "jspi")]
     fn dw_register_http_fs(db: Handle);
 }
 
@@ -90,7 +80,6 @@ fn open() -> std::result::Result<Db, String> {
             return Err(format!("open failed: {msg}"));
         }
         // Range-read http(s) FileSystem; only usable from the JSPI export (src/jspi.rs).
-        #[cfg(feature = "jspi")]
         dw_register_http_fs(db);
         let mut con: Handle = std::ptr::null_mut();
         if duckdb_connect(db, &mut con) != 0 {
@@ -99,15 +88,12 @@ fn open() -> std::result::Result<Db, String> {
         // Range reads: every parquet read is a fetch() subrequest (50 per request on the Free
         // plan). Coalescing column chunks less than 4 MB apart into one read keeps a row group at
         // ~1-2 requests (473 MB / 19 row groups / 3 columns: 59 requests by default, 40 with this).
-        #[cfg(feature = "jspi")]
-        {
-            let sql = CString::new("SET parquet_prefetch_column_gap = 4194304").unwrap();
-            let mut res: DuckResult = std::mem::zeroed();
-            let rc = duckdb_query(con, sql.as_ptr(), &mut res);
-            duckdb_destroy_result(&mut res);
-            if rc != 0 {
-                return Err("SET parquet_prefetch_column_gap failed".into());
-            }
+        let sql = CString::new("SET parquet_prefetch_column_gap = 4194304").unwrap();
+        let mut res: DuckResult = std::mem::zeroed();
+        let rc = duckdb_query(con, sql.as_ptr(), &mut res);
+        duckdb_destroy_result(&mut res);
+        if rc != 0 {
+            return Err("SET parquet_prefetch_column_gap failed".into());
         }
         Ok(Db { _db: db, con })
     }
@@ -156,73 +142,6 @@ fn query(sql: &str) -> (bool, String) {
     })
 }
 
-/// How remote files are copied into MEMFS.
-#[derive(Clone, Copy, PartialEq)]
-enum FetchMode {
-    /// Buffer the whole body in wasm memory, then copy it into MEMFS (file held twice).
-    Buffer,
-    /// Presize the MEMFS file from Content-Length and stream chunks into it.
-    Stream,
-}
-
-/// Downloads every quoted http(s) URL in `sql` into /tmp/remote and returns the
-/// rewritten SQL plus the total bytes fetched.
-async fn prefetch_remote(sql: &str, mode: FetchMode) -> Result<(String, usize)> {
-    use futures_util::StreamExt;
-    use std::io::Write;
-    let io = |e: std::io::Error| Error::RustError(e.to_string());
-    let mut out = String::with_capacity(sql.len());
-    let mut total = 0;
-    let mut n = 0;
-    let mut rest = sql;
-    let dir = std::path::Path::new("/tmp/remote");
-    while let Some(start) = rest.find("'http") {
-        let (head, tail) = rest.split_at(start + 1);
-        out.push_str(head);
-        let end = tail.find('\'').ok_or_else(|| Error::RustError("unterminated URL literal".into()))?;
-        let url = &tail[..end];
-        if !(url.starts_with("https://") || url.starts_with("http://")) {
-            out.push_str(url);
-            rest = &tail[end..];
-            continue;
-        }
-        let mut resp = Fetch::Url(Url::parse(url)?).send().await?;
-        if resp.status_code() != 200 {
-            return Err(Error::RustError(format!("GET {url}: HTTP {}", resp.status_code())));
-        }
-        // Keep the extension so DuckDB's replacement scans pick the right reader.
-        let name = url.split(['?', '#']).next().unwrap().rsplit('/').next().unwrap_or("file");
-        std::fs::create_dir_all(dir).map_err(io)?;
-        n += 1;
-        let local = dir.join(format!("{n}_{name}"));
-        match mode {
-            FetchMode::Buffer => {
-                let bytes = resp.bytes().await?;
-                total += bytes.len();
-                std::fs::write(&local, &bytes).map_err(io)?;
-            }
-            FetchMode::Stream => {
-                let len = resp.headers().get("content-length")?.and_then(|v| v.parse::<u64>().ok());
-                let mut file = std::fs::File::create(&local).map_err(io)?;
-                if let Some(len) = len {
-                    // One exact MEMFS allocation instead of grow-and-copy while appending.
-                    file.set_len(len).map_err(io)?;
-                }
-                let mut body = resp.stream()?;
-                while let Some(chunk) = body.next().await {
-                    let chunk = chunk?;
-                    total += chunk.len();
-                    file.write_all(&chunk).map_err(io)?;
-                }
-            }
-        }
-        out.push_str(local.to_str().unwrap());
-        rest = &tail[end..];
-    }
-    out.push_str(rest);
-    Ok((out, total))
-}
-
 /// Current wasm linear memory. It only grows, so after a request it is the isolate's peak.
 fn wasm_memory_bytes() -> usize {
     core::arch::wasm32::memory_size(0) * 65536
@@ -232,52 +151,4 @@ fn wasm_memory_bytes() -> usize {
 fn duckdb_memory_bytes() -> String {
     let (_, out) = query("SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()");
     out.lines().nth(1).unwrap_or("?").to_string()
-}
-
-#[event(fetch)]
-async fn fetch(mut req: Request, _env: Env, _ctx: Context) -> Result<Response> {
-    let url = req.url()?;
-    let param = |name: &str| url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v.into_owned());
-    let sql = match req.method() {
-        Method::Post => req.text().await?,
-        _ => param("q").unwrap_or_else(|| {
-            "SELECT version() AS version, (SELECT string_agg(extension_name, ',') FROM duckdb_extensions() WHERE loaded) AS extensions, current_setting('memory_limit') AS memory_limit".into()
-        }),
-    };
-    // Benchmark knobs: fetch=buffer|stream, efc=0|1 (external file cache), ml=<memory_limit>.
-    let mode = match param("fetch").as_deref() {
-        Some("buffer") => FetchMode::Buffer,
-        _ => FetchMode::Stream,
-    };
-    let mut setup = Vec::new();
-    if let Some(efc) = param("efc") {
-        setup.push(format!("SET enable_external_file_cache = {}", efc == "1"));
-    }
-    if let Some(ml) = param("ml") {
-        setup.push(format!("SET memory_limit = '{}'", ml.replace('\'', "")));
-    }
-    for stmt in &setup {
-        let (ok, err) = query(stmt);
-        if !ok {
-            return Ok(Response::ok(err)?.with_status(400));
-        }
-    }
-
-    let mem_before = wasm_memory_bytes();
-    let (sql, fetched) = match prefetch_remote(&sql, mode).await {
-        Ok(v) => v,
-        Err(e) => return Ok(Response::ok(e.to_string())?.with_status(502)),
-    };
-    let mem_fetched = wasm_memory_bytes();
-    let (ok, body) = query(&sql);
-    let duckdb_mem = duckdb_memory_bytes();
-    let _ = std::fs::remove_dir_all("/tmp/remote");
-    let mut resp = Response::ok(body)?.with_status(if ok { 200 } else { 400 });
-    let headers = resp.headers_mut();
-    headers.set("x-remote-bytes", &fetched.to_string())?;
-    headers.set("x-wasm-mem-before", &mem_before.to_string())?;
-    headers.set("x-wasm-mem-fetched", &mem_fetched.to_string())?;
-    headers.set("x-wasm-mem-after", &wasm_memory_bytes().to_string())?;
-    headers.set("x-duckdb-mem", &duckdb_mem)?;
-    Ok(resp)
 }

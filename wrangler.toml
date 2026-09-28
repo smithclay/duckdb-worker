@@ -1,8 +1,10 @@
+# Builds from source. Needs the JSPI toolchain: scripts/jspi-toolchain.sh, then
+#   eval "$(scripts/jspi-toolchain.sh env)"
 name = "duckdb-tiny"
-main = "build/index.js"
+main = "src/entry.js"
 compatibility_date = "2026-09-02"
 # new_module_registry gives the Emscripten glue `import.meta.url`.
 compatibility_flags = ["new_module_registry"]
 
 [build]
-command = "worker-build --emscripten --release"
+command = "RUSTFLAGS=\"--cfg=wasm_bindgen_unstable_jspi --remap-path-prefix=$HOME=~\" worker-build --emscripten --release"
