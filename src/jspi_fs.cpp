@@ -10,6 +10,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 extern "C" {
@@ -17,16 +18,57 @@ extern "C" {
 int64_t dw_http_size(const char *url, size_t url_len);
 //! Reads [offset, offset + len) into buf; returns bytes read or -1 on error.
 int64_t dw_http_read(const char *url, size_t url_len, uint64_t offset, void *buf, uint64_t len);
+//! fetch() calls this invocation may still make (Workers cap subrequests per invocation).
+int64_t dw_http_budget_remaining();
 }
 
 namespace duckdb {
 
-//! Every read is a fetch() subrequest, and Workers cap those per invocation (50 on the Free
-//! plan), so reads are served from one read-ahead window per handle: small reads (footer, page
-//! headers) pull in SMALL_WINDOW, large ones (column chunks) at least LARGE_WINDOW, and the
-//! following reads of the same row group usually land inside it.
-static constexpr idx_t SMALL_WINDOW = 4 * 1024 * 1024;
-static constexpr idx_t LARGE_WINDOW = 16 * 1024 * 1024;
+//! Each fetch() is a subrequest, and Workers cap those per invocation (50 on the Free plan).
+//! Keeping the count low is DuckDB's job: parquet coalesces the column chunks of a row group into
+//! one read when the gap between them is below `parquet_prefetch_column_gap`. This FileSystem
+//! stays simple: large reads are fetched exactly as asked, one request each, and small reads
+//! (footer, page headers) go through a cache of BLOCK-aligned blocks so they share requests.
+static constexpr idx_t BLOCK = 1024 * 1024;
+//! Scans move forward, so a couple of cached runs is enough.
+static constexpr idx_t CACHED_RUNS = 2;
+
+//! One fetch(): a run of consecutive blocks, kept as a single buffer.
+struct FetchedRun {
+	idx_t first_block;
+	idx_t end_block;
+	vector<data_t> bytes;
+};
+
+struct RemoteFile {
+	idx_t size = 0;
+	//! Most recently used first.
+	vector<FetchedRun> runs;
+};
+
+//! Per-query state shared by every handle, so re-opening a URL costs no requests.
+struct RemoteCache {
+	unordered_map<string, RemoteFile> files;
+};
+static RemoteCache &Cache() {
+	static RemoteCache cache;
+	return cache;
+}
+
+static RemoteFile *LookupOrProbe(const string &url) {
+	auto &files = Cache().files;
+	auto entry = files.find(url);
+	if (entry != files.end()) {
+		return &entry->second;
+	}
+	auto size = dw_http_size(url.c_str(), url.size());
+	if (size < 0) {
+		return nullptr;
+	}
+	auto &file = files[url];
+	file.size = NumericCast<idx_t>(size);
+	return &file;
+}
 
 class RangeFileHandle : public FileHandle {
 public:
@@ -34,14 +76,10 @@ public:
 	    : FileHandle(fs, path, flags), size(size) {
 	}
 	void Close() override {
-		window.clear();
-		window.shrink_to_fit();
 	}
 
 	idx_t size;
 	idx_t position = 0;
-	idx_t window_start = 0;
-	vector<data_t> window;
 };
 
 class JspiHttpFileSystem : public FileSystem {
@@ -51,14 +89,14 @@ public:
 		if (flags.OpenForWriting()) {
 			throw NotImplementedException("JspiHttpFileSystem is read-only: %s", path);
 		}
-		auto size = dw_http_size(path.c_str(), path.size());
-		if (size < 0) {
+		auto file = LookupOrProbe(path);
+		if (!file) {
 			if (flags.ReturnNullIfNotExists()) {
 				return nullptr;
 			}
 			throw IOException("HTTP request for size of '%s' failed", path);
 		}
-		return make_uniq<RangeFileHandle>(*this, path, flags, NumericCast<idx_t>(size));
+		return make_uniq<RangeFileHandle>(*this, path, flags, file->size);
 	}
 
 	void Read(FileHandle &handle_p, void *buffer, int64_t nr_bytes, idx_t location) override {
@@ -70,20 +108,32 @@ public:
 		if (location + len > handle.size) {
 			throw IOException("Read past end of '%s' (%llu + %llu > %llu)", handle.path, location, len, handle.size);
 		}
-		bool hit = location >= handle.window_start && location + len <= handle.window_start + handle.window.size();
-		if (!hit) {
-			idx_t window = len < SMALL_WINDOW ? SMALL_WINDOW : MaxValue<idx_t>(len, LARGE_WINDOW);
-			// Near the end of the file, align the window to the end so the footer and its length share a request.
-			idx_t start = location + window > handle.size ? (handle.size > window ? handle.size - window : 0) : location;
-			start = MinValue<idx_t>(start, location);
-			idx_t end = MinValue<idx_t>(MaxValue<idx_t>(start + window, location + len), handle.size);
-			handle.window.clear();
-			handle.window.shrink_to_fit(); // release the old window before fetching the next one
-			handle.window.resize(end - start);
-			FetchExact(handle, handle.window.data(), start, end - start);
-			handle.window_start = start;
+		auto &file = *LookupOrProbe(handle.path);
+		auto out = static_cast<data_ptr_t>(buffer);
+		if (len >= BLOCK) {
+			// Column chunks (already coalesced by parquet): straight into DuckDB's buffer.
+			CheckedRead(handle.path, file, out, location, len);
+			return;
 		}
-		memcpy(buffer, handle.window.data() + (location - handle.window_start), len);
+		idx_t first = location / BLOCK;
+		idx_t last = (location + len - 1) / BLOCK;
+		for (idx_t block = first; block <= last; block++) {
+			auto run = FindRun(file, block);
+			if (!run) {
+				// Fetch this block and any following uncached blocks of the read in one request.
+				idx_t run_end = block + 1;
+				while (run_end <= last && !FindRun(file, run_end)) {
+					run_end++;
+				}
+				run = FetchRun(handle.path, file, block, run_end);
+			}
+			idx_t block_start = block * BLOCK;
+			idx_t block_end = MinValue(block_start + BLOCK, file.size);
+			idx_t copy_start = MaxValue(location, block_start);
+			idx_t copy_end = MinValue(location + len, block_end);
+			idx_t run_start = run->first_block * BLOCK;
+			memcpy(out + (copy_start - location), run->bytes.data() + (copy_start - run_start), copy_end - copy_start);
+		}
 	}
 
 	int64_t Read(FileHandle &handle_p, void *buffer, int64_t nr_bytes) override {
@@ -121,7 +171,7 @@ public:
 		return false;
 	}
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
-		return dw_http_size(filename.c_str(), filename.size()) >= 0;
+		return LookupOrProbe(filename) != nullptr;
 	}
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override {
 		// No listing over HTTP: a URL names exactly one file.
@@ -135,16 +185,51 @@ public:
 	}
 
 private:
-	static void FetchExact(RangeFileHandle &handle, data_ptr_t out, idx_t offset, idx_t len) {
-		auto got = dw_http_read(handle.path.c_str(), handle.path.size(), offset, out, len);
-		if (got != NumericCast<int64_t>(len)) {
-			throw IOException("HTTP range read of '%s' [%llu, +%llu) failed (got %lld)", handle.path, offset, len,
-			                  static_cast<long long>(got));
+	static FetchedRun *FindRun(RemoteFile &file, idx_t block) {
+		for (idx_t i = 0; i < file.runs.size(); i++) {
+			if (block >= file.runs[i].first_block && block < file.runs[i].end_block) {
+				if (i > 0) {
+					std::rotate(file.runs.begin(), file.runs.begin() + NumericCast<int64_t>(i),
+					            file.runs.begin() + NumericCast<int64_t>(i) + 1);
+				}
+				return &file.runs[0];
+			}
 		}
+		return nullptr;
+	}
+
+	static FetchedRun *FetchRun(const string &url, RemoteFile &file, idx_t first, idx_t end) {
+		// Evict before fetching so at most CACHED_RUNS buffers are ever resident.
+		while (file.runs.size() > CACHED_RUNS - 1) {
+			file.runs.pop_back();
+		}
+		idx_t start = first * BLOCK;
+		idx_t stop = MinValue(end * BLOCK, file.size);
+		FetchedRun run {first, end, vector<data_t>(stop - start)};
+		CheckedRead(url, file, run.bytes.data(), start, stop - start);
+		file.runs.insert(file.runs.begin(), std::move(run));
+		return &file.runs[0];
+	}
+
+	static void CheckedRead(const string &url, RemoteFile &file, data_ptr_t out, idx_t start, idx_t len) {
+		auto got = dw_http_read(url.c_str(), url.size(), start, out, len);
+		if (got == NumericCast<int64_t>(len)) {
+			return;
+		}
+		if (dw_http_budget_remaining() <= 0) {
+			throw IOException("Subrequest budget exhausted reading '%s' (Workers Free plan: 50 per request). Project "
+			                  "fewer columns, raise parquet_prefetch_column_gap, or pass a higher budget on a paid plan",
+			                  url);
+		}
+		throw IOException("HTTP range read of '%s' [%llu, +%llu) failed", url, start, len);
 	}
 };
 
 } // namespace duckdb
+
+extern "C" void dw_reset_http_cache() {
+	duckdb::Cache().files.clear();
+}
 
 extern "C" void dw_register_http_fs(duckdb_database db) {
 	auto wrapper = reinterpret_cast<duckdb::DatabaseWrapper *>(db);

@@ -96,6 +96,19 @@ fn open() -> std::result::Result<Db, String> {
         if duckdb_connect(db, &mut con) != 0 {
             return Err("connect failed".into());
         }
+        // Range reads: every parquet read is a fetch() subrequest (50 per request on the Free
+        // plan). Coalescing column chunks less than 4 MB apart into one read keeps a row group at
+        // ~1-2 requests (473 MB / 19 row groups / 3 columns: 59 requests by default, 40 with this).
+        #[cfg(feature = "jspi")]
+        {
+            let sql = CString::new("SET parquet_prefetch_column_gap = 4194304").unwrap();
+            let mut res: DuckResult = std::mem::zeroed();
+            let rc = duckdb_query(con, sql.as_ptr(), &mut res);
+            duckdb_destroy_result(&mut res);
+            if rc != 0 {
+                return Err("SET parquet_prefetch_column_gap failed".into());
+            }
+        }
         Ok(Db { _db: db, con })
     }
 }

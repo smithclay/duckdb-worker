@@ -19,7 +19,9 @@ export default class extends Entrypoint {
       const started = Date.now();
       let body, status = 200;
       try {
-        body = await this.query_jspi(sql ?? "SELECT 42");
+        // Free plan: 50 subrequests per invocation; pass ?budget= on paid plans.
+        const budget = Number(url.searchParams.get("budget") ?? 50);
+        body = await this.query_jspi(sql ?? "SELECT 42", budget);
       } catch (e) {
         body = String(e?.message ?? e);
         status = 400;
@@ -30,6 +32,7 @@ export default class extends Entrypoint {
         headers: {
           "x-range-requests": String(stats.range_requests),
           "x-range-bytes": String(stats.range_bytes),
+          "x-range-budget": url.searchParams.get("budget") ?? "50",
           "x-wasm-mem-after": String(stats.wasm_memory),
           "x-duckdb-mem": String(stats.duckdb_memory),
           "x-elapsed-ms": String(Date.now() - started),

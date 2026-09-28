@@ -45,6 +45,27 @@ extern "C" {
 thread_local! {
     static REQUESTS: Cell<u64> = const { Cell::new(0) };
     static BYTES: Cell<u64> = const { Cell::new(0) };
+    /// fetch() calls allowed per query (Workers cap subrequests per invocation: 50 on Free).
+    static BUDGET: Cell<u64> = const { Cell::new(50) };
+}
+
+extern "C" {
+    fn dw_reset_http_cache();
+}
+
+/// Counts a subrequest, or returns false when the budget is spent (so we fail with a clear
+/// error instead of the runtime's "Too many subrequests").
+fn take_request() -> bool {
+    if REQUESTS.get() >= BUDGET.get() {
+        return false;
+    }
+    REQUESTS.set(REQUESTS.get() + 1);
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn dw_http_budget_remaining() -> i64 {
+    BUDGET.get() as i64 - REQUESTS.get() as i64
 }
 
 unsafe fn url_str<'a>(ptr: *const u8, len: usize) -> &'a str {
@@ -54,7 +75,9 @@ unsafe fn url_str<'a>(ptr: *const u8, len: usize) -> &'a str {
 #[no_mangle]
 pub extern "C" fn dw_http_size(url: *const u8, url_len: usize) -> i64 {
     let url = unsafe { url_str(url, url_len) };
-    REQUESTS.set(REQUESTS.get() + 1);
+    if !take_request() {
+        return -1;
+    }
     match dw_fetch_size(url) {
         Ok(n) if n >= 0.0 => n as i64,
         _ => -1,
@@ -64,7 +87,9 @@ pub extern "C" fn dw_http_size(url: *const u8, url_len: usize) -> i64 {
 #[no_mangle]
 pub extern "C" fn dw_http_read(url: *const u8, url_len: usize, offset: u64, buf: *mut u8, len: u64) -> i64 {
     let url = unsafe { url_str(url, url_len) };
-    REQUESTS.set(REQUESTS.get() + 1);
+    if !take_request() {
+        return -1;
+    }
     match dw_fetch_range(url, offset as f64, len as f64) {
         Ok(bytes) if bytes.length() as u64 == len => {
             // Take the destination slice only after resuming: memory may have grown meanwhile.
@@ -85,12 +110,17 @@ fn web_sys_log(msg: &str) {
     worker::console_error!("{msg}");
 }
 
-/// Runs `sql` with range-read I/O. Resolves to TSV; rejects with DuckDB's error.
+/// Runs `sql` with range-read I/O, making at most `budget` fetch() calls. Resolves to TSV;
+/// rejects with DuckDB's error.
 #[wasm_bindgen(jspi)]
-pub fn query_jspi(sql: String) -> Result<String, JsValue> {
+pub fn query_jspi(sql: String, budget: u32) -> Result<String, JsValue> {
     REQUESTS.set(0);
     BYTES.set(0);
+    BUDGET.set(budget as u64);
+    // Cached sizes/blocks are per query: no stale data, and no memory held between requests.
+    unsafe { dw_reset_http_cache() };
     let (ok, body) = crate::query(&sql);
+    unsafe { dw_reset_http_cache() };
     if ok {
         Ok(body)
     } else {
