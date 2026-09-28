@@ -135,10 +135,8 @@ Other size variants: `tiny/build.sh <variant>` (see the `case` in the script). T
   `HTTPUtil` (`DBConfig::SetHTTPUtil`) and build `httpfs`.
 - Reuse a downloaded file across requests in the same isolate (cache keyed by URL) instead of
   re-downloading.
-- Older idea: true range-request reads (like `httpfs`) need a sync-to-async bridge (JSPI or Asyncify) behind a
-  DuckDB `FileSystem`.
-  [ducklings](https://tobilg.com/posts/custom-duckdb-wasm-builds-for-cloudflare-workers/) does this with
-  Asyncify, but on JS-based EH, which is incompatible with this target.
+- For comparison, [ducklings](https://tobilg.com/posts/custom-duckdb-wasm-builds-for-cloudflare-workers/)
+  bridges `httpfs` to `fetch()` with Asyncify, but on JS-based EH, which is incompatible with this target.
 - Track down the LTO exception bug.
 - Deploy via the new [`cf` CLI](https://blog.cloudflare.com/cloudflare-cf-cli-launch/) once
   `cf deploy --temporary` is exposed; as of cf 1.0.0-beta.5 it is not.
