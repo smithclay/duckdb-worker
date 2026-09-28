@@ -17,6 +17,9 @@ use worker::*;
 
 fn main() {}
 
+#[cfg(feature = "jspi")]
+mod jspi;
+
 #[repr(C)]
 struct DuckResult {
     deprecated_column_count: u64,
@@ -44,6 +47,8 @@ extern "C" {
     fn duckdb_column_name(result: *mut DuckResult, col: u64) -> *const c_char;
     fn duckdb_value_varchar(result: *mut DuckResult, col: u64, row: u64) -> *mut c_char;
     fn duckdb_free(ptr: *mut c_void);
+    #[cfg(feature = "jspi")]
+    fn dw_register_http_fs(db: Handle);
 }
 
 struct Db {
@@ -84,6 +89,9 @@ fn open() -> std::result::Result<Db, String> {
             duckdb_free(err as *mut c_void);
             return Err(format!("open failed: {msg}"));
         }
+        // Range-read http(s) FileSystem; only usable from the JSPI export (src/jspi.rs).
+        #[cfg(feature = "jspi")]
+        dw_register_http_fs(db);
         let mut con: Handle = std::ptr::null_mut();
         if duckdb_connect(db, &mut con) != 0 {
             return Err("connect failed".into());
