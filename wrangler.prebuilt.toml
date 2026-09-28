@@ -1,0 +1,6 @@
+# Deploys the committed prebuilt bundle in dist/ (no Rust/emscripten toolchain needed).
+name = "duckdb-tiny"
+main = "dist/index.js"
+compatibility_date = "2026-09-02"
+# new_module_registry gives the Emscripten glue `import.meta.url`.
+compatibility_flags = ["new_module_registry"]

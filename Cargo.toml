@@ -1,0 +1,15 @@
+[package]
+name = "duckdb-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: the emscripten target and beta toolchain stay out of any workspace.
+[workspace]
+
+[dependencies]
+# Pinned to the workers-rs commit that ships the --emscripten target (worker 0.8.7).
+worker = { git = "https://github.com/cloudflare/workers-rs", rev = "b57ba6ef8198c65499c2f92b1845cc2412dd6e8c" }
+
+[profile.release]
+opt-level = "s"
