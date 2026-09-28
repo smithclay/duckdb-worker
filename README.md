@@ -35,28 +35,40 @@ Results come back as TSV. Errors return HTTP 400 with DuckDB's message. The resp
 
 ## Results
 
-### Remote files (production, Free plan)
+### Remote files
 
-| query | requests | fetched | time | wasm |
+Measured on a Worker deployed to the Cloudflare Workers **Free plan** (a `--temporary` account), 2026-09-28.
+
+| query | HTTP range requests | bytes downloaded (MB) | query time (s) | peak DuckDB memory in the Worker (MB) |
 |---|---:|---:|---:|---:|
-| 473 MB Parquet, GROUP BY + 2 aggregates | 40 | 121 MB | 2.7 s | 27 MB |
-| 473 MB Parquet, `count(*)` | 2 | 0.9 MB | ~0.1–1 s | 18 MB |
-| 48 MB Parquet, GROUP BY | 5 | 4.1 MB | ~0.5 s | 18 MB |
-| 48 MB Parquet, every column | 5 | 48 MB | — | 50 MB |
-| CSV / JSON (small) | 2 | <0.1 MB | ~0.2–0.5 s | 43–45 MB |
+| 473 MB Parquet, GROUP BY + 2 aggregates | 40 | 121 | 2.7 | 27 |
+| 473 MB Parquet, `count(*)` | 2 | 0.9 | 0.1–1.3 | 18 |
+| 48 MB Parquet, GROUP BY | 5 | 4.1 | 0.4–1.2 | 18 |
+| 48 MB Parquet, every column | 5 | 48 | not recorded | 50 |
+| 48 KB CSV / 100 KB JSON | 2 | <0.1 | 0.2–0.5 | 43–45 |
+
+- **HTTP range requests**: `fetch()` calls DuckDB made to read the file, one subrequest each (the Free
+  plan allows 50 per request). It includes the one that probes the file's size.
+- **Bytes downloaded**: how much of the file was actually transferred. For Parquet, that's only the footer
+  and the columns the query touches. Files from servers that compress their responses (these CSV/JSON
+  files) are downloaded whole, once per query.
+- **Query time**: end-to-end wall time measured by `curl`, including the downloads.
+- **Peak DuckDB memory in the Worker**: the size of the WebAssembly linear memory that holds DuckDB after
+  the query (`x-wasm-mem-after`). It only grows, so it's the peak, and it counts against the Worker's
+  128 MB limit (along with the JS heap, which isn't measured here). About 18 MB is DuckDB's baseline.
 
 Details, request tuning and known limits are in [docs/range-reads.md](docs/range-reads.md). The memory
 model and the removed download-first design are in [docs/memory.md](docs/memory.md).
 
 ### Size
 
-| build | wasm raw | brotli |
+| build | `.wasm` file size, uncompressed (MB) | compressed (MB) |
 |---|---:|---:|
-| DuckDB + core_functions + parquet + json, `-O3` | 36.8 MB | 5.3 MB |
-| same, `-Oz` | 20.3 MB | 3.7 MB |
-| **same, `-Oz` + `SMALLER_BINARY` (except window/sort)**, used here | **16.4 MB** | **3.5 MB** |
-| engine only, no extensions | 13.1 MB | 2.8 MB |
-| Worker bundle (the build above + Rust + JSPI) | 20.2 MB | 5.4 MB gzip |
+| DuckDB + core_functions + parquet + json, `-O3` | 36.8 | 5.3 (brotli) |
+| same, `-Oz` | 20.3 | 3.7 (brotli) |
+| **same, `-Oz` + `SMALLER_BINARY` (except window/sort)**, used here | **16.4** | **3.5 (brotli)** |
+| engine only, no extensions | 13.1 | 2.8 (brotli) |
+| Worker bundle (the build above + Rust + JSPI) | 20.2 | 5.4 (gzip, as uploaded) |
 
 `-Oz` is also *faster* than `-O3` here. Dropping `core_functions` saves only ~0.2 MB compressed and loses
 `sum`/`avg`. LTO breaks C++ exception handling. The full matrix and benchmarks are in

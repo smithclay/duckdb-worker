@@ -14,8 +14,8 @@ chunks a query needs, and memory is bounded by DuckDB's buffers rather than the 
 | `src/jspi_fs.cpp` | `JspiHttpFileSystem`: DuckDB `FileSystem` for `http(s)://`; large reads fetched exactly, small reads via a 1 MB block cache; sizes/blocks cached per query |
 | `src/main.rs` | opens DuckDB (`memory_limit=64MB`, `parquet_prefetch_column_gap=4MB`), runs queries over the C API |
 
-JSPI (`WebAssembly.Suspending` / `WebAssembly.promising`) is available in production Workers and local
-workerd (verified 2026-09-28).
+JSPI (`WebAssembly.Suspending` / `WebAssembly.promising`) is available on deployed Workers (checked on the
+Free plan) and in local workerd (verified 2026-09-28).
 
 ## Toolchain
 
@@ -41,11 +41,11 @@ because reads are sequential.
   `parquet_prefetch_column_gap`. The worker sets it to 4 MB (`bench/gapsweep.sh`, 473 MB file, 19 row
   groups, 3 columns):
 
-  | gap | requests | fetched | notes |
+  | gap (MB) | HTTP range requests | bytes downloaded (MB) | notes |
   |---|---:|---:|---|
-  | default (cost model) / 0 / 1 MB | 59 | 90 MB | over the Free cap |
-  | **4 MB** | **40** | **121 MB** | 2.7 s on production |
-  | 16 MB+ | — | — | not measured (origin started returning 403) |
+  | default (cost model) / 0 / 1 | 59 | 90 | over the Free cap |
+  | **4** | **40** | **121** | 2.7 s deployed (Free plan) |
+  | 16+ | — | — | not measured (origin started returning 403) |
 
 - **Budget guard.** `?budget=` (default 50). When it's spent, the query fails with a clear
   "Subrequest budget exhausted" error instead of the runtime's generic one.
@@ -65,17 +65,19 @@ therefore probed with a 1 KiB range: if exactly the requested bytes come back, r
 the whole decoded body is downloaded once and sliced for the rest of the query. This fallback is needed by
 jsDelivr (compresses on the fly) and by shell.duckdb.org (stores files gzip-encoded).
 
-## Results (production, temporary account = Free plan, 2026-09-28)
+## Results (deployed on the Workers Free plan via a `--temporary` account, 2026-09-28)
 
-| query | requests | fetched | time | wasm |
+| query | HTTP range requests | bytes downloaded (MB) | query time (s) | peak wasm memory (MB) |
 |---|---:|---:|---:|---:|
-| 473 MB fhvhv, GROUP BY + 2 aggregates | 40 | 121 MB | 2.7 s | 26.6 MB |
-| 473 MB fhvhv, `count(*)` | 2 | 0.9 MB | 0.1–1.3 s | 18.4 MB |
-| 48 MB yellow taxi, GROUP BY | 5 | 4.1 MB | 0.4–1.2 s | 18.4 MB |
-| 48 MB yellow taxi, all columns | 5 | 48 MB | — | 49.9 MB |
-| 1.7 MB lineitem (gzip-stored, whole-body fallback) | 6 | 3.4 MB | 1.2 s | 18.4 MB |
-| 48 KB CSV / 100 KB JSON (whole-body fallback) | 2 | <0.1 MB | 0.2–0.5 s | 43–45 MB |
-| 127 MB taxi_2019_04 (114 row groups) | — | — | — | ❌ budget exhausted at 50 |
+| 473 MB fhvhv, GROUP BY + 2 aggregates | 40 | 121 | 2.7 | 26.6 |
+| 473 MB fhvhv, `count(*)` | 2 | 0.9 | 0.1–1.3 | 18.4 |
+| 48 MB yellow taxi, GROUP BY | 5 | 4.1 | 0.4–1.2 | 18.4 |
+| 48 MB yellow taxi, all columns | 5 | 48 | not recorded | 49.9 |
+| 1.7 MB lineitem (gzip-stored, whole-body fallback) | 6 | 3.4 | 1.2 | 18.4 |
+| 48 KB CSV / 100 KB JSON (whole-body fallback) | 2 | <0.1 | 0.2–0.5 | 43–45 |
+| 127 MB taxi_2019_04 (114 row groups) | 50 | — | — | ❌ subrequest budget exhausted |
+
+Column definitions are in the [README](../README.md#remote-files).
 
 ## Known limits
 
