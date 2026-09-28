@@ -1,0 +1,5 @@
+# Local memory benchmarking: serves the last worker-build output without rebuilding.
+name = "duckdb-tiny-bench"
+main = "build/index.js"
+compatibility_date = "2026-09-02"
+compatibility_flags = ["new_module_registry"]

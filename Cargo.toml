@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 # Pinned to the workers-rs commit that ships the --emscripten target (worker 0.8.7).
+futures-util = { version = "0.3", default-features = false }
 worker = { git = "https://github.com/cloudflare/workers-rs", rev = "b57ba6ef8198c65499c2f92b1845cc2412dd6e8c" }
 
 [profile.release]

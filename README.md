@@ -46,7 +46,11 @@ Results come back as TSV. SQL errors return HTTP 400 with DuckDB's message.
 - **Remote files**: DuckDB's file I/O is synchronous, and a Worker can only `fetch()` asynchronously.
   So each quoted `'http(s)://…'` literal in the SQL is downloaded first into Emscripten's in-memory
   filesystem, and the SQL is rewritten to point at the local copy. That means whole-file downloads with no
-  range requests, and no `httpfs`.
+  range requests, and no `httpfs`. The body is streamed into a MEMFS file presized from `Content-Length`
+  (`fetch=stream`, the default); `fetch=buffer` buffers it in wasm memory first, for comparison.
+- Benchmark knobs: `fetch=stream|buffer`, `efc=0|1` (external file cache) and `ml=<memory_limit>`.
+  Each response carries `x-remote-bytes`, `x-wasm-mem-before`, `x-wasm-mem-fetched`, `x-wasm-mem-after`
+  (wasm memory only grows, so this is the isolate's peak) and `x-duckdb-mem` headers.
 
 ## Results
 
@@ -61,10 +65,23 @@ Results come back as TSV. SQL errors return HTTP 400 with DuckDB's message.
 | Remote parquet: 2-file join, 4.5 MB | ✅ ~0.9 s |
 | Remote CSV / JSON (48 KB / 100 KB) | ✅ |
 | Remote parquet, 50 MB (NYC taxi): `count(*)` (footer only) | ✅ 1.0 s |
-| Remote parquet, 50 MB: aggregation | ❌ error 1102 (resource limit: the file is held twice in memory) |
+| Remote parquet, 48 MB: scan/aggregation, buffered download | ❌ error 1102 (wasm memory reaches 2.5–2.8x the file size) |
+| Remote parquet, 48 MB: scan/aggregation, streamed download | ✅ first query in a fresh isolate (scan 2.1 s, group by 1.1 s); ❌ 1102 on repeat queries in the same isolate |
 | Remote parquet, 127 MB | ❌ error 1101 |
 
 Right after a deploy, expect a few seconds of transient 1104/1042 errors while it propagates.
+
+### Memory (`bench/membench.sh`, [local](bench/local-results.txt) / [deployed](bench/deployed-results.txt))
+
+- A freshly opened DuckDB uses 18.5 MB of wasm linear memory.
+- **Buffered download** (`resp.bytes()`): the growing `Vec` pushes wasm memory to about 2.5–2.8x the file
+  size (48 MB file → 122–133 MB), and MEMFS holds another copy in the JS heap.
+- **Streamed download**: wasm memory doesn't move during the download, and MEMFS holds 1x in the JS heap.
+  The query then adds DuckDB working memory: +0 for `count(*)`, +14 MB to scan every column of 15 MB,
+  +30 MB for 48 MB.
+- Wasm memory never shrinks, and a dropped MEMFS file waits for JS GC. So a *second* large query in the
+  same isolate can exceed 128 MB even when the first one fit.
+- `enable_external_file_cache` made no measurable difference for local (MEMFS) files.
 
 ### How small can DuckDB v2 get? (`tiny/`, full table in [tiny/RESULTS.md](tiny/RESULTS.md))
 
@@ -111,9 +128,14 @@ Other size variants: `tiny/build.sh <variant>` (see the `case` in the script). T
 
 ## Next steps
 
-- Stream the fetch body into MEMFS instead of buffering it, which should roughly double the usable
-  file size.
-- True range-request reads (like `httpfs`) need a sync-to-async bridge (JSPI or Asyncify) behind a
+- **Range reads via JSPI**: JS Promise Integration (`WebAssembly.Suspending`/`promising`) is available
+  in production Workers (verified 2026-09-28), so synchronous DuckDB reads can suspend on an async
+  `fetch()` with a `Range` header, and memory becomes bounded by DuckDB's buffer pool rather than the file
+  size. Either write a small custom `FileSystem`, or plug a JSPI-backed `HTTPClient` into DuckDB's
+  `HTTPUtil` (`DBConfig::SetHTTPUtil`) and build `httpfs`.
+- Reuse a downloaded file across requests in the same isolate (cache keyed by URL) instead of
+  re-downloading.
+- Older idea: true range-request reads (like `httpfs`) need a sync-to-async bridge (JSPI or Asyncify) behind a
   DuckDB `FileSystem`.
   [ducklings](https://tobilg.com/posts/custom-duckdb-wasm-builds-for-cloudflare-workers/) does this with
   Asyncify, but on JS-based EH, which is incompatible with this target.

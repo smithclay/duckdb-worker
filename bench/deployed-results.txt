@@ -1,0 +1,18 @@
+Deployed (temporary account, 2026-09-28). Isolates are reused between requests, so results depend on history.
+
+Matrix (in order, same isolate where not crashed):
+fhv_15MB     count  stream  200  wasm_peak 18.5 MB
+fhv_15MB     count  buffer  200  wasm_peak 34.4 MB
+fhv_15MB     scan   stream  200  wasm_peak 32.1 MB
+fhv_15MB     scan   buffer  200  wasm_peak 34.4 MB
+yellow_48MB  count  stream  1102 (isolate already at 34 MB wasm + prior MEMFS garbage)
+yellow_48MB  count  buffer  200  wasm_peak 122.1 MB (fresh isolate after the crash)
+yellow_48MB  scan   stream  200  wasm_peak 48.6 MB, 1.9 s
+yellow_48MB  scan   buffer  1102
+
+Repeats of 48 MB queries, stream mode:
+scan     200 (2.1 s, 48.6 MB) -> 1101 -> 1102
+groupby  1102 -> 200 (1.1 s, 34.4 MB) -> 1102
+topk     1102 -> 1102
+=> the first large query in a fresh isolate succeeds; the next one in the same isolate exceeds 128 MB
+   (wasm memory never shrinks + the previous file's MEMFS ArrayBuffer awaiting GC + the new download).
