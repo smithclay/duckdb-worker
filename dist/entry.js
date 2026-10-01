@@ -3,7 +3,6 @@
 //
 //   GET  /?q=<sql>   run one read-only statement, TSV back (errors: HTTP 400 with DuckDB's message)
 //   POST /           run the body as SQL
-//   HTTP 429         this isolate already has MAX_PENDING queries running or waiting
 //   GET  /           version, loaded extensions, settings
 //   &budget=<n>      max fetch() subrequests for the query (default 50, the Free plan's external cap)
 
@@ -17,7 +16,7 @@ const INFO_SQL = `SELECT version() AS version,
 
 // One DuckDB connection per isolate: run queries one at a time, since a query can be
 // suspended mid-read while another request arrives. Past MAX_PENDING, turn requests away rather
-// than let them wait behind several multi-second scans.
+// than let them wait behind several multi-second scans (HTTP 429).
 const MAX_PENDING = 4;
 let queue = Promise.resolve();
 let pending = 0;

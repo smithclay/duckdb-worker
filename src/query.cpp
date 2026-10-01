@@ -3,21 +3,51 @@
 // The database is shared by every request an isolate serves, so callers only get read-only
 // statements: exactly one SELECT or EXPLAIN that modifies no database (the configuration is
 // locked separately in src/main.rs). Rows are streamed chunk by chunk rather than materialized,
-// and the output stops at MAX_RESULT_BYTES.
+// and the output stops at MAX_RESULT_BYTES. Columns are cast to VARCHAR a vector at a time.
 
 #include "duckdb.hpp"
 #include "duckdb/main/capi/capi_internal.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/main/query_result_stream.hpp"
-
-#include <cstdlib>
-#include <cstring>
 
 namespace duckdb {
 
-//! The TSV lives in wasm memory (which never shrinks) and is then copied into a JS string.
+//! The TSV lives in wasm memory (which never shrinks) until it is copied into the JS response.
 static constexpr idx_t MAX_RESULT_BYTES = 8 * 1024 * 1024;
 
-static string RunReadOnly(Connection &con, const string &sql) {
+//! Appends `chunk` as TSV rows, NULL for nulls.
+static void AppendTsv(DataChunk &chunk, string &out) {
+	vector<Vector> text;
+	vector<UnifiedVectorFormat> formats(chunk.ColumnCount());
+	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+		auto &source = chunk.data[col];
+		if (source.GetType().id() == LogicalTypeId::VARCHAR) {
+			source.ToUnifiedFormat(chunk.size(), formats[col]);
+			continue;
+		}
+		text.emplace_back(LogicalType::VARCHAR, chunk.size());
+		VectorOperations::DefaultCast(source, text.back(), chunk.size());
+		text.back().ToUnifiedFormat(chunk.size(), formats[col]);
+	}
+	for (idx_t row = 0; row < chunk.size(); row++) {
+		for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
+			if (col) {
+				out += '\t';
+			}
+			auto &format = formats[col];
+			auto idx = format.sel->get_index(row);
+			if (!format.validity.RowIsValid(idx)) {
+				out += "NULL";
+				continue;
+			}
+			auto value = UnifiedVectorFormat::GetData<string_t>(format)[idx];
+			out.append(value.GetData(), value.GetSize());
+		}
+		out += '\n';
+	}
+}
+
+static void RunReadOnly(Connection &con, const string &sql, string &out) {
 	auto statements = con.ExtractStatements(sql);
 	if (statements.size() != 1) {
 		throw InvalidInputException("Send exactly one statement (got %llu)", statements.size());
@@ -42,21 +72,12 @@ static string RunReadOnly(Connection &con, const string &sql) {
 	}
 	QueryResultStream stream(std::move(submitted));
 
-	string out;
 	for (idx_t col = 0; col < stream.ColumnCount(); col++) {
 		out += (col ? "\t" : "") + stream.ColumnName(col).GetIdentifierName();
 	}
 	out += '\n';
 	while (auto chunk = stream.Fetch()) {
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			for (idx_t col = 0; col < chunk->ColumnCount(); col++) {
-				if (col) {
-					out += '\t';
-				}
-				out += chunk->GetValue(col, row).ToString();
-			}
-			out += '\n';
-		}
+		AppendTsv(*chunk, out);
 		if (out.size() > MAX_RESULT_BYTES) {
 			throw OutOfRangeException("Result is larger than %llu MB: add a LIMIT or aggregate",
 			                          MAX_RESULT_BYTES >> 20);
@@ -65,24 +86,27 @@ static string RunReadOnly(Connection &con, const string &sql) {
 	if (stream.HasError()) {
 		stream.GetErrorObject().Throw();
 	}
-	return out;
 }
 
 } // namespace duckdb
 
-//! Runs `sql` on `con`. Returns 0 with TSV in *out, or 1 with an error message in *out.
-//! *out is malloc'd (free with duckdb_free).
-extern "C" int dw_query(duckdb_connection con, const char *sql, size_t sql_len, char **out, size_t *out_len) {
-	int rc = 0;
-	std::string text;
+//! Runs `sql` on `con`, setting *ok and pointing *data/*size at TSV or an error message. Returns the
+//! buffer that owns them, to release with dw_free_output once copied out.
+extern "C" void *dw_query(duckdb_connection con, const char *sql, size_t sql_len, int *ok, const char **data,
+                          size_t *size) {
+	auto out = new std::string();
+	*ok = 1;
 	try {
-		text = duckdb::RunReadOnly(*reinterpret_cast<duckdb::Connection *>(con), std::string(sql, sql_len));
+		duckdb::RunReadOnly(*reinterpret_cast<duckdb::Connection *>(con), std::string(sql, sql_len), *out);
 	} catch (std::exception &ex) {
-		rc = 1;
-		text = duckdb::ErrorData(ex).Message();
+		*ok = 0;
+		*out = duckdb::ErrorData(ex).Message();
 	}
-	*out = static_cast<char *>(malloc(text.size()));
-	memcpy(*out, text.data(), text.size());
-	*out_len = text.size();
-	return rc;
+	*data = out->data();
+	*size = out->size();
+	return out;
+}
+
+extern "C" void dw_free_output(void *out) {
+	delete static_cast<std::string *>(out);
 }

@@ -33,6 +33,11 @@ export function dw_reset_bodies() {
   versions.clear();
 }
 
+// The full size from a 206's Content-Range ("bytes a-b/total"), or null.
+function totalSize(r) {
+  return r.headers.get("content-range")?.split("/")[1] ?? null;
+}
+
 function tooLarge(url) {
   return new Error(`${url} can't be read in ranges (the server compresses it or ignores Range) and is ` +
     `over the ${MAX_WHOLE_BODY >> 20} MB limit for downloading it whole`);
@@ -64,12 +69,7 @@ async function wholeBody(url) {
       chunks.push(value);
     }
   }
-  const body = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.length;
-  }
+  const body = new Uint8Array(await new Blob(chunks).arrayBuffer());
   wholeBodies.set(url, body);
   return body;
 }
@@ -79,7 +79,7 @@ async function wholeBody(url) {
 // Apache's inode-based ETags) can disagree on the ETag of one unchanged file.
 function checkVersion(url, r) {
   const seen = {
-    size: r.headers.get("content-range")?.split("/")[1] ?? null,
+    size: totalSize(r),
     modified: r.headers.get("last-modified"),
     etag: r.headers.get("etag"),
   };
@@ -99,7 +99,7 @@ export async function dw_fetch_size(url) {
   const r = await fetch(url, { headers: { range: `bytes=0-${PROBE - 1}` } });
   if (r.status === 206) {
     const probe = new Uint8Array(await r.arrayBuffer());
-    const total = Number(r.headers.get("content-range")?.split("/")[1]);
+    const total = Number(totalSize(r));
     if (total > 0 && probe.length === Math.min(PROBE, total)) {
       checkVersion(url, r);
       return total;
@@ -123,7 +123,7 @@ export async function dw_fetch_range(url, start, len) {
     }
     body = await wholeBody(url);
   }
-  return body.slice(start, start + len);
+  return body.subarray(start, start + len);
 }
 "#)]
 extern "C" {
@@ -221,10 +221,10 @@ pub extern "C" fn dw_http_read(url: *const u8, url_len: usize, offset: u64, buf:
     }
 }
 
-/// Runs `sql` with range-read I/O, making at most `budget` fetch() calls. Resolves to TSV;
+/// Runs `sql` with range-read I/O, making at most `budget` fetch() calls. Resolves to TSV bytes;
 /// rejects with DuckDB's error.
 #[wasm_bindgen(jspi)]
-pub fn query_jspi(sql: String, budget: u32) -> Result<String, JsValue> {
+pub fn query_jspi(sql: String, budget: u32) -> Result<Uint8Array, JsValue> {
     REQUESTS.set(0);
     BYTES.set(0);
     BUDGET.set(budget as u64);
@@ -232,14 +232,15 @@ pub fn query_jspi(sql: String, budget: u32) -> Result<String, JsValue> {
     // Cached sizes/blocks/bodies are per query: no stale data, no memory held between requests.
     unsafe { dw_reset_http_cache() };
     dw_reset_bodies();
-    let (ok, body) = crate::query(&sql);
+    let result = match crate::query(&sql) {
+        // The only copy of the result into JS.
+        Ok(out) if out.ok => Ok(Uint8Array::from(out.bytes())),
+        Ok(out) => Err(JsValue::from_str(&out.text())),
+        Err(e) => Err(JsValue::from_str(&e)),
+    };
     unsafe { dw_reset_http_cache() };
     dw_reset_bodies();
-    if ok {
-        Ok(body)
-    } else {
-        Err(JsValue::from_str(&body))
-    }
+    result
 }
 
 /// Stats for the last `query_jspi` call, as JSON.

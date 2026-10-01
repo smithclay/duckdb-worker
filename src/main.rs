@@ -35,7 +35,9 @@ extern "C" {
     fn duckdb_destroy_result(result: *mut DuckResult);
     fn duckdb_free(ptr: *mut c_void);
     fn dw_register_http_fs(db: Handle);
-    fn dw_query(con: Handle, sql: *const u8, sql_len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32;
+    fn dw_query(con: Handle, sql: *const u8, sql_len: usize, ok: *mut i32, data: *mut *const u8, size: *mut usize)
+        -> Handle;
+    fn dw_free_output(out: Handle);
 }
 
 struct Db {
@@ -85,7 +87,8 @@ fn open() -> std::result::Result<Db, String> {
         // Range reads: every parquet read is a fetch() subrequest (50 per request on the Free
         // plan). Coalescing column chunks less than 4 MB apart into one read keeps a row group at
         // ~1-2 requests (473 MB / 19 row groups / 3 columns: 59 requests by default, 40 with this).
-        // Then lock the configuration: the database is shared by every request in the isolate.
+        // It is a parquet option, so it can't go in the config above. Then lock the configuration:
+        // the database is shared by every request in the isolate.
         for sql in ["SET parquet_prefetch_column_gap = 4194304", "SET lock_configuration = true"] {
             let c_sql = CString::new(sql).unwrap();
             let mut res: DuckResult = std::mem::zeroed();
@@ -99,26 +102,44 @@ fn open() -> std::result::Result<Db, String> {
     }
 }
 
-fn query(sql: &str) -> (bool, String) {
+/// A query's TSV (or error message), still in the C++ buffer that dw_query returned.
+struct Output {
+    ok: bool,
+    buf: Handle,
+    data: *const u8,
+    size: usize,
+}
+
+impl Output {
+    fn bytes(&self) -> &[u8] {
+        if self.size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.data, self.size) }
+        }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(self.bytes()).into_owned()
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        unsafe { dw_free_output(self.buf) }
+    }
+}
+
+fn query(sql: &str) -> std::result::Result<Output, String> {
     DB.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            match open() {
-                Ok(db) => *slot = Some(db),
-                Err(e) => return (false, e),
-            }
+            *slot = Some(open()?);
         }
         let con = slot.as_ref().unwrap().con;
-        let mut out: *mut u8 = std::ptr::null_mut();
-        let mut len = 0usize;
-        let rc = unsafe { dw_query(con, sql.as_ptr(), sql.len(), &mut out, &mut len) };
-        let text = if len == 0 {
-            String::new()
-        } else {
-            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(out, len) }).into_owned()
-        };
-        unsafe { duckdb_free(out as *mut c_void) };
-        (rc == 0, text)
+        let (mut ok, mut data, mut size) = (0, std::ptr::null(), 0);
+        let buf = unsafe { dw_query(con, sql.as_ptr(), sql.len(), &mut ok, &mut data, &mut size) };
+        Ok(Output { ok: ok != 0, buf, data, size })
     })
 }
 
@@ -129,6 +150,8 @@ fn wasm_memory_bytes() -> usize {
 
 /// Bytes DuckDB's buffer manager currently holds, across all tags.
 fn duckdb_memory_bytes() -> String {
-    let (_, out) = query("SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()");
-    out.lines().nth(1).unwrap_or("?").to_string()
+    match query("SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()") {
+        Ok(out) if out.ok => out.text().lines().nth(1).unwrap_or("?").to_string(),
+        _ => "?".into(),
+    }
 }
