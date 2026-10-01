@@ -18,14 +18,21 @@ const INFO_SQL = `SELECT version() AS version,
 // suspended mid-read while another request arrives. Past MAX_PENDING, turn requests away rather
 // than let them wait behind several multi-second scans (HTTP 429).
 const MAX_PENDING = 4;
+// A query whose request the runtime killed (1102) stays suspended on a fetch() that never settles.
+// After STUCK_MS it is abandoned (abandon_stuck_query) and later queries use a fresh database.
+const STUCK_MS = 30_000;
 let queue = Promise.resolve();
 let pending = 0;
+let runningSince = 0;
+// Bumped when a stuck query is abandoned, so that query can't touch the new queue's state.
+let epoch = 0;
 
 export default class extends Entrypoint {
   async fetch(request) {
     const url = new URL(request.url);
     const sql = request.method === "POST" ? await request.text() : (url.searchParams.get("q") ?? INFO_SQL);
     const budget = Number(url.searchParams.get("budget") ?? 50);
+    this.recoverIfStuck();
     if (pending >= MAX_PENDING) {
       return new Response(`Busy: ${pending} queries already running or queued in this isolate\n`, {
         status: 429,
@@ -33,8 +40,13 @@ export default class extends Entrypoint {
       });
     }
     pending++;
-    const run = queue.then(async () => {
-      const started = Date.now();
+    const prev = queue;
+    const mine = epoch;
+    let gaveUp = false;
+    const run = prev.then(async () => {
+      // Skip queries whose request gave up waiting: they would run without a live request.
+      if (gaveUp) return null;
+      const started = (runningSince = Date.now());
       let body, status = 200;
       try {
         body = await this.query_jspi(sql, budget);
@@ -42,6 +54,8 @@ export default class extends Entrypoint {
         body = String(e?.message ?? e);
         status = 400;
       }
+      if (mine !== epoch) return new Response("Query abandoned\n", { status: 503 });
+      runningSince = 0;
       const stats = JSON.parse(this.jspi_stats());
       return new Response(body, {
         status,
@@ -55,7 +69,32 @@ export default class extends Entrypoint {
         },
       });
     });
-    queue = run.catch(() => {}).finally(() => pending--);
+    queue = run.catch(() => {}).finally(() => mine === epoch && pending--);
+    // If the client goes away mid-query, its request context would be torn down with the query
+    // suspended on a fetch() that then never settles, blocking every later request in the isolate.
+    this.ctx.waitUntil(run);
+    // Waiting behind a query that never finishes would hang this request too.
+    let timer;
+    const ready = await Promise.race([
+      prev.then(() => true),
+      new Promise((resolve) => (timer = setTimeout(resolve, STUCK_MS, false))),
+    ]);
+    clearTimeout(timer);
+    if (!ready) {
+      gaveUp = true;
+      this.recoverIfStuck();
+      return new Response("Gave up waiting behind a stuck query; retry\n", { status: 503 });
+    }
     return run;
+  }
+
+  recoverIfStuck() {
+    if (runningSince && Date.now() - runningSince > STUCK_MS) {
+      this.abandon_stuck_query();
+      epoch++;
+      queue = Promise.resolve();
+      pending = 0;
+      runningSince = 0;
+    }
   }
 }

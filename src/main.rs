@@ -62,8 +62,16 @@ fn open() -> std::result::Result<Db, String> {
         duckdb_register_static_extensions();
         let mut config: Handle = std::ptr::null_mut();
         duckdb_create_config(&mut config);
-        // Workers cap an isolate at 128 MB (JS + wasm); leave headroom for code and JS.
-        for (k, v) in [("memory_limit", "64MB"), ("max_temp_directory_size", "0B")] {
+        let settings = [
+            // Workers cap an isolate at 128 MB (JS + wasm); leave headroom for code and JS.
+            ("memory_limit", "64MB"),
+            ("max_temp_directory_size", "0B"),
+            // The external file cache splits reads into 2 MiB blocks and pins them: that undoes
+            // parquet's coalesced column reads (473 MB GROUP BY: 40 subrequests -> over 50) and
+            // fills the isolate. parquet_metadata_cache below keeps just the footers instead.
+            ("enable_external_file_cache", "false"),
+        ];
+        for (k, v) in settings {
             let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
             if duckdb_set_config(config, k.as_ptr(), v.as_ptr()) != 0 {
                 return Err(format!("set_config {k:?} failed"));
@@ -87,9 +95,14 @@ fn open() -> std::result::Result<Db, String> {
         // Range reads: every parquet read is a fetch() subrequest (50 per request on the Free
         // plan). Coalescing column chunks less than 4 MB apart into one read keeps a row group at
         // ~1-2 requests (473 MB / 19 row groups / 3 columns: 59 requests by default, 40 with this).
-        // It is a parquet option, so it can't go in the config above. Then lock the configuration:
-        // the database is shared by every request in the isolate.
-        for sql in ["SET parquet_prefetch_column_gap = 4194304", "SET lock_configuration = true"] {
+        // Parquet footers are cached across queries, validated with the ETag / Last-Modified that
+        // src/jspi_fs.cpp reports. Both are parquet options, so they can't go in the config above.
+        // Then lock the configuration: the database is shared by every request in the isolate.
+        for sql in [
+            "SET parquet_prefetch_column_gap = 4194304",
+            "SET parquet_metadata_cache = true",
+            "SET lock_configuration = true",
+        ] {
             let c_sql = CString::new(sql).unwrap();
             let mut res: DuckResult = std::mem::zeroed();
             let rc = duckdb_query(con, c_sql.as_ptr(), &mut res);
@@ -131,16 +144,24 @@ impl Drop for Output {
 }
 
 fn query(sql: &str) -> std::result::Result<Output, String> {
-    DB.with(|cell| {
+    // The borrow ends before dw_query, which may suspend: a query abandoned mid-suspension
+    // (see abandon_database) must not keep the database borrowed.
+    let con = DB.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
             *slot = Some(open()?);
         }
-        let con = slot.as_ref().unwrap().con;
-        let (mut ok, mut data, mut size) = (0, std::ptr::null(), 0);
-        let buf = unsafe { dw_query(con, sql.as_ptr(), sql.len(), &mut ok, &mut data, &mut size) };
-        Ok(Output { ok: ok != 0, buf, data, size })
-    })
+        Ok::<_, String>(slot.as_ref().unwrap().con)
+    })?;
+    let (mut ok, mut data, mut size) = (0, std::ptr::null(), 0);
+    let buf = unsafe { dw_query(con, sql.as_ptr(), sql.len(), &mut ok, &mut data, &mut size) };
+    Ok(Output { ok: ok != 0, buf, data, size })
+}
+
+/// Leaves the current database to a query that will never resume (its request was killed while
+/// it waited on a fetch()), so the next query opens a fresh one. The old database is leaked.
+fn abandon_database() {
+    DB.with(|cell| cell.borrow_mut().take().map(std::mem::forget));
 }
 
 /// Current wasm linear memory. It only grows, so after a request it is the isolate's peak.

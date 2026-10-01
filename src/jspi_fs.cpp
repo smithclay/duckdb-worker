@@ -14,8 +14,17 @@
 #include <cstring>
 
 extern "C" {
-//! Total size of the resource in bytes, or -1 on error.
-int64_t dw_http_size(const char *url, size_t url_len);
+//! What a size probe learned besides the size. Mirrors `DwProbe` in src/jspi.rs.
+struct DwProbe {
+	size_t tail_len;
+	char etag[256];
+	size_t etag_len;
+	int64_t last_modified_ms;
+};
+//! Total size of the resource in bytes, or -1 on error. Fills *probe.
+int64_t dw_http_size(const char *url, size_t url_len, DwProbe *probe);
+//! Copies the last probe's tail (probe->tail_len bytes) into buf.
+void dw_http_take_tail(void *buf, size_t len);
 //! Reads [offset, offset + len) into buf; returns bytes read or -1 on error.
 int64_t dw_http_read(const char *url, size_t url_len, uint64_t offset, void *buf, uint64_t len);
 //! fetch() calls this invocation may still make (Workers cap subrequests per invocation).
@@ -49,6 +58,11 @@ struct FetchedRun {
 
 struct RemoteFile {
 	idx_t size = 0;
+	//! The file's last bytes, fetched with the size probe (often the whole parquet footer block).
+	vector<data_t> tail;
+	//! ETag and Last-Modified, which parquet_metadata_cache uses to reuse footers across queries.
+	string version_tag;
+	timestamp_t last_modified = timestamp_t::epoch();
 	//! Most recently used first.
 	vector<FetchedRun> runs;
 };
@@ -68,12 +82,19 @@ static RemoteFile *LookupOrProbe(const string &url) {
 	if (entry != files.end()) {
 		return &entry->second;
 	}
-	auto size = dw_http_size(url.c_str(), url.size());
+	DwProbe probe {};
+	auto size = dw_http_size(url.c_str(), url.size(), &probe);
 	if (size < 0) {
 		return nullptr;
 	}
 	auto &file = files[url];
 	file.size = NumericCast<idx_t>(size);
+	file.tail.resize(probe.tail_len);
+	dw_http_take_tail(file.tail.data(), probe.tail_len);
+	file.version_tag = string(probe.etag, probe.etag_len);
+	if (probe.last_modified_ms > 0) {
+		file.last_modified = Timestamp::FromEpochMs(probe.last_modified_ms);
+	}
 	return &file;
 }
 
@@ -117,6 +138,11 @@ public:
 		}
 		auto &file = *LookupOrProbe(handle.path);
 		auto out = static_cast<data_ptr_t>(buffer);
+		idx_t tail_start = file.size - file.tail.size();
+		if (location >= tail_start) {
+			memcpy(out, file.tail.data() + (location - tail_start), len);
+			return;
+		}
 		if (len >= BLOCK) {
 			// Column chunks (already coalesced by parquet): straight into DuckDB's buffer.
 			CheckedRead(handle.path, file, out, location, len);
@@ -156,11 +182,10 @@ public:
 		return NumericCast<int64_t>(handle.Cast<RangeFileHandle>().size);
 	}
 	timestamp_t GetLastModifiedTime(FileHandle &handle) override {
-		// Unknown over plain HTTP here; only used for cache validation.
-		return timestamp_t::epoch();
+		return LookupOrProbe(handle.path)->last_modified;
 	}
 	string GetVersionTag(FileHandle &handle) override {
-		return "";
+		return LookupOrProbe(handle.path)->version_tag;
 	}
 	FileType GetFileType(FileHandle &handle) override {
 		return FileType::FILE_TYPE_REGULAR;

@@ -41,25 +41,27 @@ query at a time and queues up to three more; past that it returns HTTP 429.
 
 ### Remote files
 
-Measured on a Worker deployed to the Cloudflare Workers **Free plan** (a `--temporary` account), 2026-09-28.
+Measured on a Worker deployed to the Cloudflare Workers **Free plan** (a `--temporary` account),
+2026-10-01 (the every-column row: 2026-09-28).
 
 | query | HTTP range requests | bytes downloaded (MB) | query time (s) | peak DuckDB memory in the Worker (MB) |
 |---|---:|---:|---:|---:|
-| 473 MB Parquet, GROUP BY + 2 aggregates | 40 | 121 | 2.7 | 27 |
-| 473 MB Parquet, `count(*)` | 2 | 0.9 | 0.1–1.3 | 18 |
-| 48 MB Parquet, GROUP BY | 5 | 4.1 | 0.4–1.2 | 18 |
+| 473 MB Parquet, GROUP BY + 2 aggregates | 39 | 61 | 2.5 | 24 |
+| 473 MB Parquet, `count(*)` | 1 | 1.0 | 0.8–1.3 | 20 |
+| 48 MB Parquet, GROUP BY | 4 | 4.2 | 0.5–1.0 | 20 |
 | 48 MB Parquet, every column | 5 | 48 | not recorded | 50 |
-| 48 KB CSV / 100 KB JSON | 2 | <0.1 | 0.2–0.5 | 43–45 |
+| 48 KB CSV / 100 KB JSON | 2 | <0.1 | 0.1–0.5 | 46–48 |
 
 - **HTTP range requests**: `fetch()` calls DuckDB made to read the file, one subrequest each (the Free
-  plan allows 50 per request). It includes the one that probes the file's size.
+  plan allows 50 per request). It includes the one that probes the file's size, which also brings back
+  the file's last 1 MB (a Parquet footer, or all of a small file).
 - **Bytes downloaded**: how much of the file was actually transferred. For Parquet, that's only the footer
   and the columns the query touches. Files from servers that compress their responses (these CSV/JSON
   files) are downloaded whole, once per query.
 - **Query time**: end-to-end wall time measured by `curl`, including the downloads.
 - **Peak DuckDB memory in the Worker**: the size of the WebAssembly linear memory that holds DuckDB after
   the query (`x-wasm-mem-after`). It only grows, so it's the peak, and it counts against the Worker's
-  128 MB limit (along with the JS heap, which isn't measured here). About 18 MB is DuckDB's baseline.
+  128 MB limit (along with the JS heap, which isn't measured here). About 20 MB is DuckDB's baseline.
 
 Details, request tuning and known limits are in [docs/range-reads.md](docs/range-reads.md). The memory
 model and the removed download-first design are in [docs/memory.md](docs/memory.md).
