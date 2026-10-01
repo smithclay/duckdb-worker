@@ -15,7 +15,8 @@ namespace duckdb {
 //! The TSV lives in wasm memory (which never shrinks) until it is copied into the JS response.
 static constexpr idx_t MAX_RESULT_BYTES = 8 * 1024 * 1024;
 
-//! Appends `chunk` as TSV rows, NULL for nulls.
+//! Appends `chunk` as TSV rows, NULL for nulls, stopping at MAX_RESULT_BYTES (checked per row, since
+//! one chunk of wide rows can be far larger than the cap).
 static void AppendTsv(DataChunk &chunk, string &out) {
 	vector<Vector> text;
 	vector<UnifiedVectorFormat> formats(chunk.ColumnCount());
@@ -44,6 +45,10 @@ static void AppendTsv(DataChunk &chunk, string &out) {
 			out.append(value.GetData(), value.GetSize());
 		}
 		out += '\n';
+		if (out.size() > MAX_RESULT_BYTES) {
+			throw OutOfRangeException("Result is larger than %llu MB: add a LIMIT or aggregate",
+			                          MAX_RESULT_BYTES >> 20);
+		}
 	}
 }
 
@@ -78,10 +83,6 @@ static void RunReadOnly(Connection &con, const string &sql, string &out) {
 	out += '\n';
 	while (auto chunk = stream.Fetch()) {
 		AppendTsv(*chunk, out);
-		if (out.size() > MAX_RESULT_BYTES) {
-			throw OutOfRangeException("Result is larger than %llu MB: add a LIMIT or aggregate",
-			                          MAX_RESULT_BYTES >> 20);
-		}
 	}
 	if (stream.HasError()) {
 		stream.GetErrorObject().Throw();

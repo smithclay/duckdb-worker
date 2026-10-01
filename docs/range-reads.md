@@ -93,6 +93,9 @@ Column definitions are in the [README](../README.md#remote-files).
   raised), and CSV uses 16 × the maximum line size, whatever the file size. Wasm memory never shrinks, so
   one JSON query leaves an isolate at ~45–70 MB of wasm. Parquet is the format this design is built for.
 - **Free-plan CPU** is 10 ms per request. The temporary account allowed ~1.7 s of CPU; don't rely on that.
+- **Very wide rows.** Results stop at 8 MB, but DuckDB builds a whole chunk (up to 2,048 rows) before
+  any of it is written out, and string data isn't counted against `memory_limit`. Rows of ~100 KB each
+  can exhaust the isolate (1102) before the cap applies.
 - **One query at a time** per isolate (a suspended query holds the connection). Up to three more wait;
   further requests get HTTP 429.
 - The wasm is 20.2 MB (vs 17.5 MB before JSPI; `REENTRANT_JSPI` adds stack guard checks).
