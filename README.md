@@ -33,6 +33,10 @@ Results come back as TSV. Errors return HTTP 400 with DuckDB's message. The resp
 `x-range-requests`, `x-range-bytes`, `x-wasm-mem-after` and `x-elapsed-ms` show the cost of each query.
 `?budget=` sets the maximum number of subrequests (default 50).
 
+Each request runs one read-only statement (`SELECT` or `EXPLAIN`) against a database the isolate keeps
+between requests, with its configuration locked. Results stream out and stop at 8 MB. An isolate runs one
+query at a time and queues up to three more; past that it returns HTTP 429.
+
 ## Results
 
 ### Remote files
@@ -81,12 +85,14 @@ model and the removed download-first design are in [docs/memory.md](docs/memory.
   small row groups need more requests; aim for 100K–1M rows per row group.
 - **Memory:** 128 MB per isolate, and wasm memory never shrinks. JSON/CSV readers allocate fixed
   ~25–50 MB buffers. Back-to-back heavy queries in one isolate can hit 1102.
+- **Files that can't be range-read** (the server compresses them or ignores `Range`) are downloaded
+  whole, up to 32 MB. A file that changes during a query (size, Last-Modified or ETag) fails it.
 - **CPU:** 10 ms per request on the Free plan (the temporary account was more lenient); paid is 30 s by
   default.
 
 ## Build from source
 
-Requirements: Rust **beta** with `wasm32-unknown-emscripten`, worker-build 0.8.7, cmake, ninja,
+Requirements: Rust **1.98.0** with `wasm32-unknown-emscripten`, worker-build 0.8.7, cmake, ninja,
 python3, and Node.js.
 
 ```sh

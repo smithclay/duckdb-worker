@@ -63,7 +63,12 @@ On a compressed response, `Range`/`Content-Range` describe the encoded bytes, an
 partial range is empty or garbled, so asking for `Accept-Encoding: identity` doesn't help. Each URL is
 therefore probed with a 1 KiB range: if exactly the requested bytes come back, ranges are used; otherwise
 the whole decoded body is downloaded once and sliced for the rest of the query. This fallback is needed by
-jsDelivr (compresses on the fly) and by shell.duckdb.org (stores files gzip-encoded).
+jsDelivr (compresses on the fly) and by shell.duckdb.org (stores files gzip-encoded). Whole bodies are
+capped at 32 MB, since they sit in the JS heap next to DuckDB for the rest of the query.
+
+Ranged URLs are also checked for changes: the first response's total size, Last-Modified and ETag are
+remembered, and a later read that disagrees fails the query. Last-Modified is preferred over ETag when both
+are present, because load-balanced origins can disagree on the ETag of an unchanged file.
 
 ## Results (deployed on the Workers Free plan via a `--temporary` account, 2026-09-28)
 
@@ -88,7 +93,8 @@ Column definitions are in the [README](../README.md#remote-files).
   raised), and CSV uses 16 × the maximum line size, whatever the file size. Wasm memory never shrinks, so
   one JSON query leaves an isolate at ~45–70 MB of wasm. Parquet is the format this design is built for.
 - **Free-plan CPU** is 10 ms per request. The temporary account allowed ~1.7 s of CPU; don't rely on that.
-- **One query at a time** per isolate (a suspended query holds the connection).
+- **One query at a time** per isolate (a suspended query holds the connection). Up to three more wait;
+  further requests get HTTP 429.
 - The wasm is 20.2 MB (vs 17.5 MB before JSPI; `REENTRANT_JSPI` adds stack guard checks).
 
 ## Why not DuckDB v2's async I/O?

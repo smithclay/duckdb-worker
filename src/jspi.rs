@@ -10,7 +10,7 @@
 #![allow(deprecated)] // wasm-bindgen marks jspi/suspending as experimental via deprecation warnings
 
 use js_sys::Uint8Array;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(inline_js = r#"
@@ -21,18 +21,77 @@ use wasm_bindgen::prelude::*;
 // exactly the requested bytes back means ranges work; anything else means download the whole
 // (decoded) body once and serve slices of it for this query.
 const PROBE = 1024;
+// A whole body lives in the JS heap for the rest of the query, next to DuckDB's wasm memory,
+// and the isolate has 128 MB for both.
+const MAX_WHOLE_BODY = 32 * 1024 * 1024;
 const wholeBodies = new Map();
+// What each ranged URL looked like at its first response, to catch a file changing mid-query.
+const versions = new Map();
 
 export function dw_reset_bodies() {
   wholeBodies.clear();
+  versions.clear();
+}
+
+function tooLarge(url) {
+  return new Error(`${url} can't be read in ranges (the server compresses it or ignores Range) and is ` +
+    `over the ${MAX_WHOLE_BODY >> 20} MB limit for downloading it whole`);
 }
 
 async function wholeBody(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`HTTP ${r.status} for ${url}`);
-  const body = new Uint8Array(await r.arrayBuffer());
+  if (!r.ok) {
+    await r.body?.cancel();
+    throw new Error(`HTTP ${r.status} for ${url}`);
+  }
+  // Content-Length is the encoded size when compressed, so the limit is also checked while reading.
+  if (Number(r.headers.get("content-length")) > MAX_WHOLE_BODY) {
+    await r.body?.cancel();
+    throw tooLarge(url);
+  }
+  const chunks = [];
+  let size = 0;
+  if (r.body) {
+    const reader = r.body.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > MAX_WHOLE_BODY) {
+        await reader.cancel();
+        throw tooLarge(url);
+      }
+      chunks.push(value);
+    }
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.length;
+  }
   wholeBodies.set(url, body);
   return body;
+}
+
+// Same file if the total size matches and so does Last-Modified, or the ETag when there is no
+// Last-Modified. Last-Modified wins over a differing ETag because load-balanced origins (e.g.
+// Apache's inode-based ETags) can disagree on the ETag of one unchanged file.
+function checkVersion(url, r) {
+  const seen = {
+    size: r.headers.get("content-range")?.split("/")[1] ?? null,
+    modified: r.headers.get("last-modified"),
+    etag: r.headers.get("etag"),
+  };
+  const first = versions.get(url);
+  if (!first) {
+    versions.set(url, seen);
+    return;
+  }
+  const differs = (k) => first[k] !== null && seen[k] !== null && first[k] !== seen[k];
+  if (differs("size") || (first.modified && seen.modified ? differs("modified") : differs("etag"))) {
+    throw new Error(`${url} changed during the query`);
+  }
 }
 
 export async function dw_fetch_size(url) {
@@ -41,7 +100,10 @@ export async function dw_fetch_size(url) {
   if (r.status === 206) {
     const probe = new Uint8Array(await r.arrayBuffer());
     const total = Number(r.headers.get("content-range")?.split("/")[1]);
-    if (total > 0 && probe.length === Math.min(PROBE, total)) return total;
+    if (total > 0 && probe.length === Math.min(PROBE, total)) {
+      checkVersion(url, r);
+      return total;
+    }
   } else {
     await r.body?.cancel();
   }
@@ -53,6 +115,7 @@ export async function dw_fetch_range(url, start, len) {
   if (!body) {
     const r = await fetch(url, { headers: { range: `bytes=${start}-${start + len - 1}` } });
     if (r.status === 206) {
+      checkVersion(url, r);
       const part = new Uint8Array(await r.arrayBuffer());
       if (part.length === len) return part;
     } else {
@@ -76,6 +139,31 @@ thread_local! {
     static BYTES: Cell<u64> = const { Cell::new(0) };
     /// fetch() calls allowed per query (Workers cap subrequests per invocation: 50 on Free).
     static BUDGET: Cell<u64> = const { Cell::new(50) };
+    /// Why the last dw_http_size / dw_http_read failed, for DuckDB's error message.
+    static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn fail(msg: String) -> i64 {
+    worker::console_error!("{msg}");
+    LAST_ERROR.set(msg);
+    -1
+}
+
+fn js_error_message(e: &JsValue) -> String {
+    e.dyn_ref::<js_sys::Error>()
+        .map(|e| String::from(e.message()))
+        .or_else(|| e.as_string())
+        .unwrap_or_else(|| format!("{e:?}"))
+}
+
+/// Copies the last fetch error into `buf` (truncated to `cap`) and returns its length.
+#[no_mangle]
+pub extern "C" fn dw_http_last_error(buf: *mut u8, cap: usize) -> usize {
+    LAST_ERROR.with_borrow(|msg| {
+        let n = msg.len().min(cap);
+        unsafe { std::ptr::copy_nonoverlapping(msg.as_ptr(), buf, n) };
+        n
+    })
 }
 
 extern "C" {
@@ -105,11 +193,12 @@ unsafe fn url_str<'a>(ptr: *const u8, len: usize) -> &'a str {
 pub extern "C" fn dw_http_size(url: *const u8, url_len: usize) -> i64 {
     let url = unsafe { url_str(url, url_len) };
     if !take_request() {
-        return -1;
+        return fail(format!("subrequest budget of {} exhausted", BUDGET.get()));
     }
     match dw_fetch_size(url) {
         Ok(n) if n >= 0.0 => n as i64,
-        _ => -1,
+        Ok(n) => fail(format!("bad size {n} for {url}")),
+        Err(e) => fail(js_error_message(&e)),
     }
 }
 
@@ -127,16 +216,9 @@ pub extern "C" fn dw_http_read(url: *const u8, url_len: usize, offset: u64, buf:
             BYTES.set(BYTES.get() + len);
             len as i64
         }
-        Ok(bytes) => bytes.length() as i64,
-        Err(e) => {
-            web_sys_log(&format!("range read failed: {e:?}"));
-            -1
-        }
+        Ok(bytes) => fail(format!("{url}: got {} bytes at offset {offset}, wanted {len}", bytes.length())),
+        Err(e) => fail(js_error_message(&e)),
     }
-}
-
-fn web_sys_log(msg: &str) {
-    worker::console_error!("{msg}");
 }
 
 /// Runs `sql` with range-read I/O, making at most `budget` fetch() calls. Resolves to TSV;
@@ -146,6 +228,7 @@ pub fn query_jspi(sql: String, budget: u32) -> Result<String, JsValue> {
     REQUESTS.set(0);
     BYTES.set(0);
     BUDGET.set(budget as u64);
+    LAST_ERROR.set(String::new());
     // Cached sizes/blocks/bodies are per query: no stale data, no memory held between requests.
     unsafe { dw_reset_http_cache() };
     dw_reset_bodies();

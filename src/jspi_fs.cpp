@@ -20,9 +20,16 @@ int64_t dw_http_size(const char *url, size_t url_len);
 int64_t dw_http_read(const char *url, size_t url_len, uint64_t offset, void *buf, uint64_t len);
 //! fetch() calls this invocation may still make (Workers cap subrequests per invocation).
 int64_t dw_http_budget_remaining();
+//! Copies why the last dw_http_size / dw_http_read failed into buf; returns its length.
+size_t dw_http_last_error(char *buf, size_t cap);
 }
 
 namespace duckdb {
+
+static string LastHttpError() {
+	char buf[512];
+	return string(buf, dw_http_last_error(buf, sizeof(buf)));
+}
 
 //! Each fetch() is a subrequest, and Workers cap those per invocation (50 on the Free plan).
 //! Keeping the count low is DuckDB's job: parquet coalesces the column chunks of a row group into
@@ -94,7 +101,7 @@ public:
 			if (flags.ReturnNullIfNotExists()) {
 				return nullptr;
 			}
-			throw IOException("HTTP request for size of '%s' failed", path);
+			throw IOException("Can't open '%s': %s", path, LastHttpError());
 		}
 		return make_uniq<RangeFileHandle>(*this, path, flags, file->size);
 	}
@@ -221,7 +228,7 @@ private:
 			                  "fewer columns, raise parquet_prefetch_column_gap, or pass a higher budget on a paid plan",
 			                  url);
 		}
-		throw IOException("HTTP range read of '%s' [%llu, +%llu) failed", url, start, len);
+		throw IOException("HTTP range read of '%s' [%llu, +%llu) failed: %s", url, start, len, LastHttpError());
 	}
 };
 

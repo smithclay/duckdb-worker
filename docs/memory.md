@@ -12,6 +12,9 @@ so the `x-wasm-mem-after` header on each response is the isolate's peak so far.
 | parquet scan of every column, 48 MB file | 49.9 |
 | after one CSV / JSON scan (fixed reader buffers) | 43–70 |
 
+These were measured before the main and JSPI stacks were raised from 64 KB to 1 MB each (`build.rs`), which
+added ~1 MB to the baseline (19.3 → 20.3 MB in local workerd).
+
 Fetched bytes pass through the JS heap as short-lived `ArrayBuffer`s and are copied into DuckDB's buffers,
 so a file is never held whole unless the server can't serve ranges (see
 [range-reads.md](range-reads.md#compressed-responses)). Details and limits:

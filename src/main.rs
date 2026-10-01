@@ -2,7 +2,8 @@
 //!
 //! One in-memory database per isolate, opened on first query. HTTP handling lives in
 //! src/entry.js, which calls the `query_jspi` export (src/jspi.rs); DuckDB reads http(s)
-//! files itself with fetch() range requests through src/jspi_fs.cpp.
+//! files itself with fetch() range requests through src/jspi_fs.cpp. Every request shares the
+//! database, so callers get read-only statements (src/query.cpp) and a locked configuration.
 
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -32,13 +33,9 @@ extern "C" {
     fn duckdb_connect(db: Handle, out: *mut Handle) -> i32;
     fn duckdb_query(con: Handle, sql: *const c_char, out: *mut DuckResult) -> i32;
     fn duckdb_destroy_result(result: *mut DuckResult);
-    fn duckdb_result_error(result: *mut DuckResult) -> *const c_char;
-    fn duckdb_column_count(result: *mut DuckResult) -> u64;
-    fn duckdb_row_count(result: *mut DuckResult) -> u64;
-    fn duckdb_column_name(result: *mut DuckResult, col: u64) -> *const c_char;
-    fn duckdb_value_varchar(result: *mut DuckResult, col: u64, row: u64) -> *mut c_char;
     fn duckdb_free(ptr: *mut c_void);
     fn dw_register_http_fs(db: Handle);
+    fn dw_query(con: Handle, sql: *const u8, sql_len: usize, out: *mut *mut u8, out_len: *mut usize) -> i32;
 }
 
 struct Db {
@@ -88,12 +85,15 @@ fn open() -> std::result::Result<Db, String> {
         // Range reads: every parquet read is a fetch() subrequest (50 per request on the Free
         // plan). Coalescing column chunks less than 4 MB apart into one read keeps a row group at
         // ~1-2 requests (473 MB / 19 row groups / 3 columns: 59 requests by default, 40 with this).
-        let sql = CString::new("SET parquet_prefetch_column_gap = 4194304").unwrap();
-        let mut res: DuckResult = std::mem::zeroed();
-        let rc = duckdb_query(con, sql.as_ptr(), &mut res);
-        duckdb_destroy_result(&mut res);
-        if rc != 0 {
-            return Err("SET parquet_prefetch_column_gap failed".into());
+        // Then lock the configuration: the database is shared by every request in the isolate.
+        for sql in ["SET parquet_prefetch_column_gap = 4194304", "SET lock_configuration = true"] {
+            let c_sql = CString::new(sql).unwrap();
+            let mut res: DuckResult = std::mem::zeroed();
+            let rc = duckdb_query(con, c_sql.as_ptr(), &mut res);
+            duckdb_destroy_result(&mut res);
+            if rc != 0 {
+                return Err(format!("{sql} failed"));
+            }
         }
         Ok(Db { _db: db, con })
     }
@@ -109,36 +109,16 @@ fn query(sql: &str) -> (bool, String) {
             }
         }
         let con = slot.as_ref().unwrap().con;
-        let Ok(sql) = CString::new(sql) else {
-            return (false, "query contains a NUL byte".into());
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut len = 0usize;
+        let rc = unsafe { dw_query(con, sql.as_ptr(), sql.len(), &mut out, &mut len) };
+        let text = if len == 0 {
+            String::new()
+        } else {
+            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(out, len) }).into_owned()
         };
-        unsafe {
-            let mut res: DuckResult = std::mem::zeroed();
-            if duckdb_query(con, sql.as_ptr(), &mut res) != 0 {
-                let msg = cstr(duckdb_result_error(&mut res));
-                duckdb_destroy_result(&mut res);
-                return (false, msg);
-            }
-            let (cols, rows) = (duckdb_column_count(&mut res), duckdb_row_count(&mut res));
-            let mut out = (0..cols)
-                .map(|c| cstr(duckdb_column_name(&mut res, c)))
-                .collect::<Vec<_>>()
-                .join("\t");
-            out.push('\n');
-            for r in 0..rows {
-                for c in 0..cols {
-                    if c > 0 {
-                        out.push('\t');
-                    }
-                    let v = duckdb_value_varchar(&mut res, c, r);
-                    out.push_str(if v.is_null() { "NULL" } else { CStr::from_ptr(v).to_str().unwrap_or("?") });
-                    duckdb_free(v as *mut c_void);
-                }
-                out.push('\n');
-            }
-            duckdb_destroy_result(&mut res);
-            (true, out)
-        }
+        unsafe { duckdb_free(out as *mut c_void) };
+        (rc == 0, text)
     })
 }
 
