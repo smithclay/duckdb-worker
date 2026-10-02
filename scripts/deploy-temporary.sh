@@ -4,7 +4,7 @@
 # wrangler login on this machine is left untouched (--temporary refuses when logged in).
 #
 #   scripts/deploy-temporary.sh                # prebuilt dist/ (needs only node)
-#   scripts/deploy-temporary.sh --from-source  # worker-build (needs tiny/build/full-sb-keep, Rust beta,
+#   scripts/deploy-temporary.sh --from-source  # worker-build (needs tiny/build/full-sb-keep, Rust 1.98.0,
 #                                              # and the JSPI toolchain: scripts/jspi-toolchain.sh)
 set -euo pipefail
 cd "$(dirname "$0")/.."

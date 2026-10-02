@@ -7,10 +7,14 @@ so the `x-wasm-mem-after` header on each response is the isolate's peak so far.
 
 | state | peak wasm memory (MB) |
 |---|---:|
-| DuckDB opened (`memory_limit=64MB`), no queries | 18.4 |
-| parquet GROUP BY on 48 MB or 473 MB files (projected columns only) | 18.4–26.6 |
-| parquet scan of every column, 48 MB file | 49.9 |
+| DuckDB opened (`memory_limit=64MB`), no queries | 20.3 |
+| parquet GROUP BY on 48 MB or 473 MB files (projected columns only) | 20.3–24.4 |
+| every column of 20,000 rows from the 48 MB file (2 MB of TSV) | 55.4 |
+| 1M-row result (6.9 MB of TSV, under the 8 MB result cap) | 40.8 |
 | after one CSV / JSON scan (fixed reader buffers) | 43–70 |
+
+Deployed on the Free plan (a `--temporary` account), 2026-10-01; the CSV/JSON row is from 2026-09-28.
+The 1 MB main and JSPI stacks (`build.rs`) account for ~1 MB of the baseline.
 
 Fetched bytes pass through the JS heap as short-lived `ArrayBuffer`s and are copied into DuckDB's buffers,
 so a file is never held whole unless the server can't serve ranges (see

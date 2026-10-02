@@ -17,7 +17,9 @@ BASE="$CACHE/emsdk-6.0.10"
 mkdir -p "$T"
 [ -d "$T/binaryen" ] || git clone -q --depth 50 -b jspi-hooks https://github.com/guybedford/binaryen.git "$T/binaryen"
 git -C "$T/binaryen" submodule update -q --init --depth 1
-cmake -S "$T/binaryen" -B "$T/binaryen/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF >/dev/null
+# binaryen defaults to macOS 10.15, which current SDKs' libc++ rejects (-Werror).
+cmake -S "$T/binaryen" -B "$T/binaryen/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 >/dev/null
 ninja -C "$T/binaryen/build" wasm-opt wasm-metadce wasm-emscripten-finalize wasm-split wasm-ctor-eval wasm-merge wasm-as wasm-dis
 [ -d "$T/emsdk" ] || cp -R "$BASE" "$T/emsdk"
 for tool in wasm-opt wasm-metadce wasm-emscripten-finalize wasm-split wasm-ctor-eval wasm-merge wasm-as wasm-dis; do

@@ -35,15 +35,17 @@ fn main() {
     }
     println!("cargo:rustc-link-arg=-Wl,--end-group");
     {
-        // The http(s) range-read FileSystem (src/jspi_fs.cpp) compiles against DuckDB's headers.
+        // The http(s) range-read FileSystem (src/jspi_fs.cpp) and the query runner (src/query.cpp)
+        // compile against DuckDB's headers.
         let src = PathBuf::from(
             std::env::var("DUCKDB_SRC")
                 .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/duckdb").into()),
         );
         println!("cargo:rerun-if-env-changed=DUCKDB_SRC");
         println!("cargo:rerun-if-changed=src/jspi_fs.cpp");
+        println!("cargo:rerun-if-changed=src/query.cpp");
         let mut build = cc::Build::new();
-        build.cpp(true).file("src/jspi_fs.cpp").include(src.join("src/include")).flag("-std=c++17").flag("-Oz");
+        build.cpp(true).file("src/jspi_fs.cpp").file("src/query.cpp").include(src.join("src/include")).flag("-std=c++17").flag("-Oz");
         // Must match the defines libduckdb_static was built with (ABI of the headers).
         for def in ["DUCKDB_NO_THREADS", "DUCKDB_DISABLE_EXTENSION_LOAD", "DUCKDB_DISABLE_BUILTIN_HTTPLIB", "NDEBUG"] {
             build.define(def, None);
@@ -53,6 +55,11 @@ fn main() {
         // suspend independently (emscripten PR #27699 + binaryen PR #9102).
         println!("cargo:rustc-link-arg=-sJSPI");
         println!("cargo:rustc-link-arg=-sREENTRANT_JSPI");
+        // Queries run on the query_jspi activation's own stack. Emscripten's 64 KB default is too
+        // shallow for DuckDB's binder and JSON schema detection; one activation runs at a time
+        // (src/entry.js), so this costs 1 MB of wasm memory, not 1 MB per request.
+        println!("cargo:rustc-link-arg=-sSTACK_SIZE=1MB");
+        println!("cargo:rustc-link-arg=-sJSPI_FIBER_STACK_SIZE=1MB");
     }
     // DuckDB is C++: have emcc pull in libc++/libc++abi like em++ would.
     println!("cargo:rustc-link-arg=-sDEFAULT_TO_CXX");

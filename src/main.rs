@@ -2,7 +2,8 @@
 //!
 //! One in-memory database per isolate, opened on first query. HTTP handling lives in
 //! src/entry.js, which calls the `query_jspi` export (src/jspi.rs); DuckDB reads http(s)
-//! files itself with fetch() range requests through src/jspi_fs.cpp.
+//! files itself with fetch() range requests through src/jspi_fs.cpp. Every request shares the
+//! database, so callers get read-only statements (src/query.cpp) and a locked configuration.
 
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -32,13 +33,11 @@ extern "C" {
     fn duckdb_connect(db: Handle, out: *mut Handle) -> i32;
     fn duckdb_query(con: Handle, sql: *const c_char, out: *mut DuckResult) -> i32;
     fn duckdb_destroy_result(result: *mut DuckResult);
-    fn duckdb_result_error(result: *mut DuckResult) -> *const c_char;
-    fn duckdb_column_count(result: *mut DuckResult) -> u64;
-    fn duckdb_row_count(result: *mut DuckResult) -> u64;
-    fn duckdb_column_name(result: *mut DuckResult, col: u64) -> *const c_char;
-    fn duckdb_value_varchar(result: *mut DuckResult, col: u64, row: u64) -> *mut c_char;
     fn duckdb_free(ptr: *mut c_void);
     fn dw_register_http_fs(db: Handle);
+    fn dw_query(con: Handle, sql: *const u8, sql_len: usize, ok: *mut i32, data: *mut *const u8, size: *mut usize)
+        -> Handle;
+    fn dw_free_output(out: Handle);
 }
 
 struct Db {
@@ -63,8 +62,16 @@ fn open() -> std::result::Result<Db, String> {
         duckdb_register_static_extensions();
         let mut config: Handle = std::ptr::null_mut();
         duckdb_create_config(&mut config);
-        // Workers cap an isolate at 128 MB (JS + wasm); leave headroom for code and JS.
-        for (k, v) in [("memory_limit", "64MB"), ("max_temp_directory_size", "0B")] {
+        let settings = [
+            // Workers cap an isolate at 128 MB (JS + wasm); leave headroom for code and JS.
+            ("memory_limit", "64MB"),
+            ("max_temp_directory_size", "0B"),
+            // The external file cache splits reads into 2 MiB blocks and pins them: that undoes
+            // parquet's coalesced column reads (473 MB GROUP BY: 40 subrequests -> over 50) and
+            // fills the isolate. parquet_metadata_cache below keeps just the footers instead.
+            ("enable_external_file_cache", "false"),
+        ];
+        for (k, v) in settings {
             let (k, v) = (CString::new(k).unwrap(), CString::new(v).unwrap());
             if duckdb_set_config(config, k.as_ptr(), v.as_ptr()) != 0 {
                 return Err(format!("set_config {k:?} failed"));
@@ -88,58 +95,73 @@ fn open() -> std::result::Result<Db, String> {
         // Range reads: every parquet read is a fetch() subrequest (50 per request on the Free
         // plan). Coalescing column chunks less than 4 MB apart into one read keeps a row group at
         // ~1-2 requests (473 MB / 19 row groups / 3 columns: 59 requests by default, 40 with this).
-        let sql = CString::new("SET parquet_prefetch_column_gap = 4194304").unwrap();
-        let mut res: DuckResult = std::mem::zeroed();
-        let rc = duckdb_query(con, sql.as_ptr(), &mut res);
-        duckdb_destroy_result(&mut res);
-        if rc != 0 {
-            return Err("SET parquet_prefetch_column_gap failed".into());
+        // Parquet footers are cached across queries, validated with the ETag / Last-Modified that
+        // src/jspi_fs.cpp reports. Both are parquet options, so they can't go in the config above.
+        // Then lock the configuration: the database is shared by every request in the isolate.
+        for sql in [
+            "SET parquet_prefetch_column_gap = 4194304",
+            "SET parquet_metadata_cache = true",
+            "SET lock_configuration = true",
+        ] {
+            let c_sql = CString::new(sql).unwrap();
+            let mut res: DuckResult = std::mem::zeroed();
+            let rc = duckdb_query(con, c_sql.as_ptr(), &mut res);
+            duckdb_destroy_result(&mut res);
+            if rc != 0 {
+                return Err(format!("{sql} failed"));
+            }
         }
         Ok(Db { _db: db, con })
     }
 }
 
-fn query(sql: &str) -> (bool, String) {
-    DB.with(|cell| {
+/// A query's TSV (or error message), still in the C++ buffer that dw_query returned.
+struct Output {
+    ok: bool,
+    buf: Handle,
+    data: *const u8,
+    size: usize,
+}
+
+impl Output {
+    fn bytes(&self) -> &[u8] {
+        if self.size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.data, self.size) }
+        }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(self.bytes()).into_owned()
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        unsafe { dw_free_output(self.buf) }
+    }
+}
+
+fn query(sql: &str) -> std::result::Result<Output, String> {
+    // The borrow ends before dw_query, which may suspend: a query abandoned mid-suspension
+    // (see abandon_database) must not keep the database borrowed.
+    let con = DB.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            match open() {
-                Ok(db) => *slot = Some(db),
-                Err(e) => return (false, e),
-            }
+            *slot = Some(open()?);
         }
-        let con = slot.as_ref().unwrap().con;
-        let Ok(sql) = CString::new(sql) else {
-            return (false, "query contains a NUL byte".into());
-        };
-        unsafe {
-            let mut res: DuckResult = std::mem::zeroed();
-            if duckdb_query(con, sql.as_ptr(), &mut res) != 0 {
-                let msg = cstr(duckdb_result_error(&mut res));
-                duckdb_destroy_result(&mut res);
-                return (false, msg);
-            }
-            let (cols, rows) = (duckdb_column_count(&mut res), duckdb_row_count(&mut res));
-            let mut out = (0..cols)
-                .map(|c| cstr(duckdb_column_name(&mut res, c)))
-                .collect::<Vec<_>>()
-                .join("\t");
-            out.push('\n');
-            for r in 0..rows {
-                for c in 0..cols {
-                    if c > 0 {
-                        out.push('\t');
-                    }
-                    let v = duckdb_value_varchar(&mut res, c, r);
-                    out.push_str(if v.is_null() { "NULL" } else { CStr::from_ptr(v).to_str().unwrap_or("?") });
-                    duckdb_free(v as *mut c_void);
-                }
-                out.push('\n');
-            }
-            duckdb_destroy_result(&mut res);
-            (true, out)
-        }
-    })
+        Ok::<_, String>(slot.as_ref().unwrap().con)
+    })?;
+    let (mut ok, mut data, mut size) = (0, std::ptr::null(), 0);
+    let buf = unsafe { dw_query(con, sql.as_ptr(), sql.len(), &mut ok, &mut data, &mut size) };
+    Ok(Output { ok: ok != 0, buf, data, size })
+}
+
+/// Leaves the current database to a query that will never resume (its request was killed while
+/// it waited on a fetch()), so the next query opens a fresh one. The old database is leaked.
+fn abandon_database() {
+    DB.with(|cell| cell.borrow_mut().take().map(std::mem::forget));
 }
 
 /// Current wasm linear memory. It only grows, so after a request it is the isolate's peak.
@@ -149,6 +171,8 @@ fn wasm_memory_bytes() -> usize {
 
 /// Bytes DuckDB's buffer manager currently holds, across all tags.
 fn duckdb_memory_bytes() -> String {
-    let (_, out) = query("SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()");
-    out.lines().nth(1).unwrap_or("?").to_string()
+    match query("SELECT coalesce(sum(memory_usage_bytes), 0) FROM duckdb_memory()") {
+        Ok(out) if out.ok => out.text().lines().nth(1).unwrap_or("?").to_string(),
+        _ => "?".into(),
+    }
 }

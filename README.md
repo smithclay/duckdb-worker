@@ -33,29 +33,35 @@ Results come back as TSV. Errors return HTTP 400 with DuckDB's message. The resp
 `x-range-requests`, `x-range-bytes`, `x-wasm-mem-after` and `x-elapsed-ms` show the cost of each query.
 `?budget=` sets the maximum number of subrequests (default 50).
 
+Each request runs one read-only statement (`SELECT` or `EXPLAIN`) against a database the isolate keeps
+between requests, with its configuration locked. Results stream out and stop at 8 MB. An isolate runs one
+query at a time and queues up to three more; past that it returns HTTP 429.
+
 ## Results
 
 ### Remote files
 
-Measured on a Worker deployed to the Cloudflare Workers **Free plan** (a `--temporary` account), 2026-09-28.
+Measured on a Worker deployed to the Cloudflare Workers **Free plan** (a `--temporary` account),
+2026-10-01 (the every-column row: 2026-09-28).
 
 | query | HTTP range requests | bytes downloaded (MB) | query time (s) | peak DuckDB memory in the Worker (MB) |
 |---|---:|---:|---:|---:|
-| 473 MB Parquet, GROUP BY + 2 aggregates | 40 | 121 | 2.7 | 27 |
-| 473 MB Parquet, `count(*)` | 2 | 0.9 | 0.1–1.3 | 18 |
-| 48 MB Parquet, GROUP BY | 5 | 4.1 | 0.4–1.2 | 18 |
+| 473 MB Parquet, GROUP BY + 2 aggregates | 39 | 61 | 2.5 | 24 |
+| 473 MB Parquet, `count(*)` | 1 | 1.0 | 0.8–1.3 | 20 |
+| 48 MB Parquet, GROUP BY | 4 | 4.2 | 0.5–1.0 | 20 |
 | 48 MB Parquet, every column | 5 | 48 | not recorded | 50 |
-| 48 KB CSV / 100 KB JSON | 2 | <0.1 | 0.2–0.5 | 43–45 |
+| 48 KB CSV / 100 KB JSON | 2 | <0.1 | 0.1–0.5 | 46–48 |
 
 - **HTTP range requests**: `fetch()` calls DuckDB made to read the file, one subrequest each (the Free
-  plan allows 50 per request). It includes the one that probes the file's size.
+  plan allows 50 per request). It includes the one that probes the file's size, which also brings back
+  the file's last 1 MB (a Parquet footer, or all of a small file).
 - **Bytes downloaded**: how much of the file was actually transferred. For Parquet, that's only the footer
   and the columns the query touches. Files from servers that compress their responses (these CSV/JSON
   files) are downloaded whole, once per query.
 - **Query time**: end-to-end wall time measured by `curl`, including the downloads.
 - **Peak DuckDB memory in the Worker**: the size of the WebAssembly linear memory that holds DuckDB after
   the query (`x-wasm-mem-after`). It only grows, so it's the peak, and it counts against the Worker's
-  128 MB limit (along with the JS heap, which isn't measured here). About 18 MB is DuckDB's baseline.
+  128 MB limit (along with the JS heap, which isn't measured here). About 20 MB is DuckDB's baseline.
 
 Details, request tuning and known limits are in [docs/range-reads.md](docs/range-reads.md). The memory
 model and the removed download-first design are in [docs/memory.md](docs/memory.md).
@@ -81,12 +87,14 @@ model and the removed download-first design are in [docs/memory.md](docs/memory.
   small row groups need more requests; aim for 100K–1M rows per row group.
 - **Memory:** 128 MB per isolate, and wasm memory never shrinks. JSON/CSV readers allocate fixed
   ~25–50 MB buffers. Back-to-back heavy queries in one isolate can hit 1102.
+- **Files that can't be range-read** (the server compresses them or ignores `Range`) are downloaded
+  whole, up to 32 MB. A file that changes during a query (size, Last-Modified or ETag) fails it.
 - **CPU:** 10 ms per request on the Free plan (the temporary account was more lenient); paid is 30 s by
   default.
 
 ## Build from source
 
-Requirements: Rust **beta** with `wasm32-unknown-emscripten`, worker-build 0.8.7, cmake, ninja,
+Requirements: Rust **1.98.0** with `wasm32-unknown-emscripten`, worker-build 0.8.7, cmake, ninja,
 python3, and Node.js.
 
 ```sh
